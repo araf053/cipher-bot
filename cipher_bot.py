@@ -152,10 +152,19 @@ class TG:
     def __init__(self,token,cid):
         self.token=token; self.cid=cid
         self.ok=bool(token and token not in ('','YOUR_TOKEN'))
+        self.ntfy=os.environ.get('NTFY_CHANNEL','')
     def send(self,msg):
-        if not self.ok: log.info(f"[TG] {msg[:80]}"); return
-        try: requests.post(f'https://api.telegram.org/bot{self.token}/sendMessage',json={'chat_id':self.cid,'text':msg,'parse_mode':'HTML'},timeout=5)
-        except: pass
+        # ntfy bildirimi
+        if self.ntfy:
+            try:
+                clean=msg.replace('<b>','').replace('</b>','').replace('<code>','').replace('</code>','')
+                requests.post(f'https://ntfy.sh/{self.ntfy}',data=clean.encode('utf-8'),timeout=5)
+            except: pass
+        # Telegram (varsa)
+        if self.ok:
+            try: requests.post(f'https://api.telegram.org/bot{self.token}/sendMessage',json={'chat_id':self.cid,'text':msg,'parse_mode':'HTML'},timeout=5)
+            except: pass
+        if not self.ntfy and not self.ok: log.info(f"[NOTIF] {msg[:80]}")
     def signal_msg(self,r,qty,paper):
         em='🟢' if r['signal']=='LONG' else '🔴'
         self.send(f"{em} <b>CIPHER {'PAPER' if paper else 'GERÇEK'}</b>\n"
