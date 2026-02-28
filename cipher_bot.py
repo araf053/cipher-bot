@@ -234,14 +234,19 @@ class CipherBot:
                 d4h=self.cli.get_klines(sym,'4h',80)
                 r=self.ci.analyze(sym,btc['1h'],d30,d1h,d4h)
                 log.info(f"  {sym:14} {r['signal']:5} %{int(r['confidence']*100)} {'⬟' if r['unanimous'] else ' '} {r['regime']} RSI:{r['rsi']:.0f}")
-                if r['signal']=='LONG' and r['confidence']>=self.cfg['min_confidence']:
+                long_only=self.cfg.get('long_only',True)
+                is_long=r['signal']=='LONG' and r['confidence']>=self.cfg['min_confidence']
+                is_short=r['signal']=='SHORT' and r['confidence']>=self.cfg['min_confidence'] and not long_only
+                if is_long or is_short:
                     qty=self.cfg['usdt_per_trade']
+                    side='LONG' if is_long else 'SHORT'
+                    bx_side='BUY' if is_long else 'SELL'
                     if self.cfg['paper_trading']:
-                        if self.pa.open(sym,'LONG',qty,r['price'],r['sl'],r['tp1'],r['tp2']):
+                        if self.pa.open(sym,side,qty,r['price'],r['sl'],r['tp1'],r['tp2']):
                             self.tg.signal_msg(r,qty,True)
                     else:
                         self.cli.set_leverage(sym,self.cfg['leverage'])
-                        self.cli.place_order(sym,'BUY',qty,sl=r['sl'],tp=r['tp1'])
+                        self.cli.place_order(sym,bx_side,qty,sl=r['sl'],tp=r['tp1'])
                         self.tg.signal_msg(r,qty,False)
                 time.sleep(0.8)
             except Exception as e: log.warning(f"  ✕ {sym}:{e}"); time.sleep(1)
