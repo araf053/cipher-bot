@@ -29,6 +29,71 @@ log = logging.getLogger('CIPHER_V2')
 
 
 # ─────────────────────────────────────────────
+#  SENTIMENT ANALİZİ
+# ─────────────────────────────────────────────
+class SentimentAnalyzer:
+    def __init__(self):
+        self.cache = {}
+
+    def _cached(self, key, ttl=900):
+        """Cache - 15 dakika geçerli"""
+        if key in self.cache:
+            val, ts = self.cache[key]
+            if time.time() - ts < ttl:
+                return val
+        return None
+
+    def fear_greed(self):
+        """Fear & Greed Index — 0 korku, 100 açgözlülük"""
+        cached = self._cached('fg')
+        if cached: return cached
+        try:
+            r = requests.get('https://api.alternative.me/fng/?limit=1', timeout=5)
+            d = r.json()
+            val   = int(d['data'][0]['value'])
+            label = d['data'][0]['value_classification']
+            result = {'score': val, 'label': label}
+            self.cache['fg'] = (result, time.time())
+            log.info(f"  Fear&Greed: {val} ({label})")
+            return result
+        except Exception as e:
+            log.warning(f"Fear&Greed hatası: {e}")
+            return {'score': 50, 'label': 'Neutral'}
+
+    def cryptopanic(self, coin='BTC'):
+        """CryptoPanic — haber sentiment"""
+        cached = self._cached(f'cp_{coin}')
+        if cached: return cached
+        try:
+            url = f'https://cryptopanic.com/api/free/v1/posts/?auth_token=free&currencies={coin}&filter=hot'
+            r   = requests.get(url, timeout=5)
+            d   = r.json()
+            results = d.get('results', [])[:10]
+            pos = sum(1 for x in results if x.get('kind') == 'news' and x.get('votes', {}).get('positive', 0) > x.get('votes', {}).get('negative', 0))
+            neg = sum(1 for x in results if x.get('kind') == 'news' and x.get('votes', {}).get('negative', 0) > x.get('votes', {}).get('positive', 0))
+            total = len(results) or 1
+            score = pos / total  # 0-1 arası, 1 = tam pozitif
+            result = {'positive': pos, 'negative': neg, 'score': score, 'total': total}
+            self.cache[f'cp_{coin}'] = (result, time.time())
+            log.info(f"  CryptoPanic {coin}: +{pos}/-{neg} (skor:{score:.2f})")
+            return result
+        except Exception as e:
+            log.warning(f"CryptoPanic hatası: {e}")
+            return {'positive': 0, 'negative': 0, 'score': 0.5, 'total': 0}
+
+    def sentiment_ok(self, side, fg_score, cp_score):
+        """Sentiment işlem yönüyle uyumlu mu?"""
+        if side == 'LONG':
+            fg_ok = fg_score < 75   # Aşırı açgözlülük yoksa LONG açılabilir
+            cp_ok = cp_score >= 0.4  # Haberler çok negatif değilse
+            return fg_ok and cp_ok
+        else:  # SHORT
+            fg_ok = fg_score > 25   # Aşırı korku yoksa SHORT açılabilir
+            cp_ok = cp_score <= 0.6  # Haberler çok pozitif değilse
+            return fg_ok and cp_ok
+
+
+# ─────────────────────────────────────────────
 #  BINGX API CLIENT
 # ─────────────────────────────────────────────
 class BingXClient:
@@ -298,6 +363,43 @@ class TA:
             return big_bids, big_asks
         except:
             return 0, 0
+
+    @staticmethod
+    def candle_direction(df, count=3):
+        """Son N mumun yönü — hepsi aynı mı?"""
+        c = df['close'].values
+        o = df['open'].values
+        directions = [1 if c[i] > o[i] else -1 for i in range(-count, 0)]
+        if all(d == 1 for d in directions):
+            return 1   # Hepsi yeşil
+        elif all(d == -1 for d in directions):
+            return -1  # Hepsi kırmızı
+        return 0       # Karışık
+
+    @staticmethod
+    def rsi_zone(df, period=14):
+        """RSI bölge kontrolü"""
+        val = TA.rsi(df['close'].values, period)
+        if val < 30:   return 'OVERSOLD'    # Aşırı satım
+        elif val > 70: return 'OVERBOUGHT'  # Aşırı alım
+        elif 40 <= val <= 65: return 'NEUTRAL_BULL'  # LONG için ideal
+        elif 35 <= val <= 60: return 'NEUTRAL_BEAR'  # SHORT için ideal
+        return 'NEUTRAL'
+
+    @staticmethod
+    def ema20_filter(df):
+        """Fiyat EMA20 üstünde mi altında mı?"""
+        c   = df['close'].values
+        e20 = TA.ema(c, 20)
+        return 'ABOVE' if c[-1] > e20 else 'BELOW'
+
+    @staticmethod
+    def momentum_check(df, period=10):
+        """Momentum — fiyat ivmesi artıyor mu?"""
+        c = df['close'].values
+        mom = c[-1] - c[-period]
+        mom_prev = c[-2] - c[-period-1]
+        return mom > 0 and mom > mom_prev  # Pozitif ve artıyor
 
 
 # ─────────────────────────────────────────────
@@ -626,8 +728,9 @@ class CipherV2:
     def __init__(self):
         self.cfg    = CONFIG
         self.cli    = BingXClient(self.cfg['api_key'], self.cfg['api_secret'], self.cfg['paper_trading'])
-        self.ta     = TA()
-        self.exit_a = ExitAnalyzer()
+        self.ta      = TA()
+        self.exit_a  = ExitAnalyzer()
+        self.sent    = SentimentAnalyzer()
         self.paper  = PaperTracker(self.cfg['initial_balance'])
         self.notif  = Notifier(self.cfg['ntfy_channel'])
         self.running = True
@@ -827,17 +930,76 @@ class CipherV2:
             log.debug(f"  {sym} skor düşük: {score}/13 │ ❌ {', '.join(failed[:3])}")
             return None
 
-        # ── TP / SL hesapla ──
-        price   = float(c[-1])
-        atr_val = TA.atr(df_1h)
-        if side == 'LONG':
-            sl  = price - atr_val * 1.2
-            tp1 = price + atr_val * 1.5
-            tp2 = price + atr_val * 3.0
+        # ── Yeni Trend Filtreleri ──
+
+        # 12. Mum yönü kontrolü (son 3 mum)
+        candle_dir = TA.candle_direction(df_1h, 3)
+        exp_dir = 1 if side == 'LONG' else -1
+        if candle_dir == exp_dir:
+            passed.append(f'CANDLE_OK')
+            score += 1
+        elif candle_dir == 0:
+            passed.append('CANDLE_MIX')  # Karışık ama engel değil
         else:
-            sl  = price + atr_val * 1.2
+            failed.append('CANDLE_AGAINST')
+            return None  # Mumlar ters yönde — girme
+
+        # 13. RSI bölge kontrolü
+        rsi_zone = TA.rsi_zone(df_1h)
+        rsi_ok = (side == 'LONG' and rsi_zone in ['OVERSOLD','NEUTRAL_BULL']) or                  (side == 'SHORT' and rsi_zone in ['OVERBOUGHT','NEUTRAL_BEAR'])
+        if rsi_ok:
+            passed.append(f'RSI_OK({rsi_zone})')
+            score += 1
+        else:
+            failed.append(f'RSI_BAD({rsi_zone})')
+            return None  # RSI aşırı bölgede — girme
+
+        # 14. EMA20 filtresi
+        ema20 = TA.ema20_filter(df_1h)
+        ema20_ok = (side == 'LONG' and ema20 == 'ABOVE') or                    (side == 'SHORT' and ema20 == 'BELOW')
+        if ema20_ok:
+            passed.append(f'EMA20_OK')
+            score += 1
+        else:
+            failed.append(f'EMA20_FAIL')
+
+        # 15. Momentum kontrolü
+        mom_ok = TA.momentum_check(df_1h)
+        if mom_ok:
+            passed.append('MOM_OK')
+            score += 1
+        else:
+            failed.append('MOM_WEAK')
+
+        # 16. Fear & Greed + CryptoPanic (Sentiment)
+        try:
+            coin = side.split('-')[0] if '-' in sym else sym.split('-')[0]
+            fg   = self.sent.fear_greed()
+            cp   = self.sent.cryptopanic(coin)
+            sent_ok = self.sent.sentiment_ok(side, fg['score'], cp['score'])
+            if sent_ok:
+                passed.append(f"SENT_OK(FG:{fg['score']}/CP:{cp['score']:.2f})")
+                score += 2
+            else:
+                failed.append(f"SENT_FAIL(FG:{fg['score']}/CP:{cp['score']:.2f})")
+                return None  # Sentiment ters — girme
+        except Exception as e:
+            log.warning(f"Sentiment hatası: {e}")
+            passed.append('SENT_SKIP')  # Hata varsa atla
+
+        # ── TP / SL hesapla — 4h ATR ile daha geniş ──
+        price   = float(c[-1])
+        atr_1h  = TA.atr(df_1h)
+        atr_4h  = TA.atr(df_4h)
+        atr_val = atr_4h  # 4h ATR kullan — daha geniş SL
+        if side == 'LONG':
+            sl  = price - atr_val * 2.0   # Daha geniş SL
+            tp1 = price + atr_val * 1.5
+            tp2 = price + atr_val * 3.5   # Daha büyük TP hedefi
+        else:
+            sl  = price + atr_val * 2.0
             tp1 = price - atr_val * 1.5
-            tp2 = price - atr_val * 3.0
+            tp2 = price - atr_val * 3.5
 
         return {
             'sym': sym, 'side': side, 'price': price,
@@ -909,13 +1071,7 @@ class CipherV2:
         log.info(f"\n{'─'*50}")
         log.info(f"🔍 TARAMA │ {datetime.now().strftime('%H:%M:%S')} │ Açık: {len(self.paper.positions)}")
 
-        # Günlük limit kontrolü
-        if self.daily_losses >= self.cfg['max_daily_losses']:
-            log.info("🛑 Günlük SL limiti doldu, işlem yok")
-            return
-        if self.daily_pnl < -self.cfg['daily_loss_limit']:
-            log.info("🛑 Günlük zarar limiti aşıldı, işlem yok")
-            return
+        # Günlük limit kapalı
 
         # BTC verisi
         try:
