@@ -433,18 +433,18 @@ class PaperTracker:
 
     def close(self, sym, price, reason):
         if sym not in self.positions:
-            return 0
-        pos  = self.positions.pop(sym)
-        pnl  = pos['qty'] * (price - pos['entry']) / pos['entry'] * (1 if pos['side'] == 'LONG' else -1)
+            return 0, 0, 0
+        pos   = self.positions.pop(sym)
+        pnl   = pos['qty'] * (price - pos['entry']) / pos['entry'] * (1 if pos['side'] == 'LONG' else -1)
         self.balance += pos['qty'] + pnl
         self.trades.append({'sym': sym, 'pnl': pnl, 'reason': reason})
         em = '✅' if pnl > 0 else '❌'
         log.info(f"[PAPER] CLOSE {em} {sym} @{price:.4f} │ {reason} │ PNL:{pnl:+.2f}")
-        return pnl
+        return pnl, pos['entry'], price
 
     def check_tp_sl(self, sym, price):
         if sym not in self.positions:
-            return None, 0
+            return None, 0, 0, 0
         pos  = self.positions[sym]
         side = pos['side']
         hit_sl  = (side == 'LONG'  and price <= pos['sl']) or \
@@ -456,15 +456,17 @@ class PaperTracker:
             (side == 'SHORT' and price <= pos['tp1'])
         )
         if hit_sl:
-            return 'SL', self.close(sym, price, 'SL')
+            pnl, ep, cp = self.close(sym, price, 'SL')
+            return 'SL', pnl, ep, cp
         if hit_tp2:
-            return 'TP2', self.close(sym, price, 'TP2')
+            pnl, ep, cp = self.close(sym, price, 'TP2')
+            return 'TP2', pnl, ep, cp
         if hit_tp1:
             pos['tp1_hit'] = True
             pos['sl'] = pos['entry']
             log.info(f"[PAPER] TP1 {sym} → SL başa çekildi")
-            return 'TP1', 0
-        return None, 0
+            return 'TP1', 0, 0, 0
+        return None, 0, 0, 0
 
     def stats(self):
         pnls    = [t['pnl'] for t in self.trades]
@@ -553,41 +555,65 @@ class Notifier:
                 pass
 
     def entry(self, sym, side, price, qty, sl, tp1, tp2, reasons, paper):
-        mode  = 'PAPER' if paper else 'GERCEK'
-        title = f"{sym} {side} ACILDI [{mode}]"
+        mode  = 'PAPER' if paper else 'CANLI'
+        em    = '🟢 LONG' if side == 'LONG' else '🔴 SHORT'
+        title = f"{em} — {sym} [{mode}]"
         msg   = (
-            f"{'LONG' if side == 'LONG' else 'SHORT'} | {sym}\n"
-            f"Fiyat: {price:.4f}\n"
-            f"TP1:{tp1:.4f}  TP2:{tp2:.4f}\n"
-            f"SL:{sl:.4f}\n"
-            f"{qty} USDT\n"
-            f"OK: {' | '.join(reasons)}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 {sym}  |  {em}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 Giriş  : {price:.4f}\n"
+            f"🎯 TP1    : {tp1:.4f}\n"
+            f"🎯 TP2    : {tp2:.4f}\n"
+            f"🛑 SL     : {sl:.4f}\n"
+            f"💰 Miktar : {qty} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
         self._ntfy_send(title, msg, sym, priority='high')
 
-    def exit_msg(self, sym, reason, pnl, balance, paper):
-        mode  = 'PAPER' if paper else 'GERCEK'
-        kar   = 'KAR' if pnl > 0 else 'ZARAR'
-        title = f"{sym} KAPANDI {kar} {pnl:+.2f} USDT [{mode}]"
+    def exit_msg(self, sym, reason, pnl, balance, entry_price, close_price, paper):
+        mode  = 'PAPER' if paper else 'CANLI'
+        em    = '✅ KAZANC' if pnl > 0 else '❌ KAYIP'
+        title = f"{em} — {sym}  {pnl:+.2f} USDT [{mode}]"
         msg   = (
-            f"{'KAZANC' if pnl > 0 else 'KAYIP'} | {sym}\n"
-            f"Sebep: {reason}\n"
-            f"PNL: {pnl:+.2f} USDT\n"
-            f"Bakiye: {balance:.2f} USDT"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 {sym}  |  {em}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔓 Giris  : {entry_price:.4f}\n"
+            f"🔒 Cikis  : {close_price:.4f}\n"
+            f"📊 Sebep  : {reason}\n"
+            f"💰 PNL    : {pnl:+.2f} USDT\n"
+            f"🏦 Bakiye : {balance:.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
         priority = 'high' if pnl > 0 else 'default'
         self._ntfy_send(title, msg, sym, priority=priority)
 
     def daily_report(self, stats, paper):
-        mode = '📝 PAPER' if paper else '💰 GERÇEK'
+        mode = 'PAPER' if paper else 'CANLI'
         pnl  = stats['total_pnl']
-        self.send(
-            f"{'📈' if pnl >= 0 else '📉'} GÜNLÜK RAPOR [{mode}]\n"
-            f"İşlem: {stats['count']}  ✅{stats['winning']} ❌{stats['losing']}\n"
-            f"Win Rate: %{stats['win_rate']:.1f}\n"
-            f"PNL: {pnl:+.2f} USDT\n"
-            f"Bakiye: {stats['balance']:.2f} USDT"
+        em   = '📈' if pnl >= 0 else '📉'
+        title = f"{em} GUNLUK RAPOR [{mode}]"
+        msg  = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{em} GUNLUK RAPOR [{mode}]\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Islem  : {stats['count']}\n"
+            f"✅ Kazanc : {stats['winning']}\n"
+            f"❌ Kayip  : {stats['losing']}\n"
+            f"🎯 Win    : %{stats['win_rate']:.1f}\n"
+            f"💰 PNL    : {pnl:+.2f} USDT\n"
+            f"🏦 Bakiye : {stats['balance']:.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
+        if self.ok:
+            try:
+                headers = {'Title': title, 'Priority': 'default', 'Tags': 'bar_chart'}
+                requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), headers=headers, timeout=5)
+            except:
+                pass
+        else:
+            log.info(f"[NOTIF] {title}")
 
     def blocked(self, sym, missing):
         self.send(f"⚠️ {sym} — Koşullar sağlanmadı\n❌ {' │ '.join(missing)}")
@@ -832,12 +858,12 @@ class CipherV2:
                     continue
 
                 # TP/SL kontrolü
-                reason, pnl = self.paper.check_tp_sl(sym, price)
+                reason, pnl, entry_p, close_p = self.paper.check_tp_sl(sym, price)
                 if reason and reason != 'TP1':
                     if pnl < 0:
                         self.daily_losses += 1
                     self.daily_pnl += pnl
-                    self.notif.exit_msg(sym, reason, pnl, self.paper.balance, self.cfg['paper_trading'])
+                    self.notif.exit_msg(sym, reason, pnl, self.paper.balance, entry_p, close_p, self.cfg['paper_trading'])
                     if reason == 'SL':
                         self.sl_times[sym] = time.time()
                     continue
