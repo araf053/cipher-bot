@@ -530,62 +530,53 @@ class Notifier:
         except:
             pass
 
-    def entry(self, sym, side, price, qty, sl, tp1, tp2, reasons, paper):
-        em    = '🟢' if side == 'LONG' else '🔴'
-        mode  = '📝 PAPER' if paper else '💰 GERÇEK'
-        title = f"{em} {sym} → {side}"
-        msg   = (
-            f"{mode}\n"
-            f"💵 Fiyat: {price:.4f}\n"
-            f"🎯 TP1:{tp1:.4f}  TP2:{tp2:.4f}\n"
-            f"🛑 SL:{sl:.4f}\n"
-            f"💰 {qty} USDT\n"
-            f"✅ {' │ '.join(reasons)}"
-        )
-        # Tıklanınca CoinMarketCap açılır, altında BingX butonu da çıkar
-        cmc_link = self._coin_to_cmc(sym)
-        bingx_link = self._coin_to_bingx(sym)
-        if self.ok:
+    def _ntfy_send(self, title, msg, sym, priority='default'):
+        if not self.ok:
+            log.info(f"[NOTIF] {title} | {msg[:80]}")
+            return
+        try:
+            cmc   = self._coin_to_cmc(sym)
+            bingx = self._coin_to_bingx(sym)
+            headers = {
+                'Title'   : title,
+                'Priority': priority,
+                'Click'   : cmc,
+                'Actions' : f"view, CoinMarketCap, {cmc}; view, BingX Futures, {bingx}",
+                'Tags'    : 'chart_with_upwards_trend'
+            }
+            requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), headers=headers, timeout=5)
+        except Exception as e:
+            log.warning(f"Bildirim hatasi: {e}")
             try:
-                clean = msg
-                headers = {
-                    'Title'   : title,
-                    'Priority': 'high',
-                    'Click'   : cmc_link,
-                    'Actions' : f"view, 📊 CoinMarketCap, {cmc_link}; view, 🔄 BingX, {bingx_link}"
-                }
-                requests.post(f'https://ntfy.sh/{self.ch}', data=clean.encode('utf-8'), headers=headers, timeout=5)
+                requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), timeout=5)
             except:
                 pass
-        else:
-            log.info(f"[NOTIF] {title} │ {msg[:80]}")
+
+    def entry(self, sym, side, price, qty, sl, tp1, tp2, reasons, paper):
+        mode  = 'PAPER' if paper else 'GERCEK'
+        title = f"{sym} {side} ACILDI [{mode}]"
+        msg   = (
+            f"{'LONG' if side == 'LONG' else 'SHORT'} | {sym}\n"
+            f"Fiyat: {price:.4f}\n"
+            f"TP1:{tp1:.4f}  TP2:{tp2:.4f}\n"
+            f"SL:{sl:.4f}\n"
+            f"{qty} USDT\n"
+            f"OK: {' | '.join(reasons)}"
+        )
+        self._ntfy_send(title, msg, sym, priority='high')
 
     def exit_msg(self, sym, reason, pnl, balance, paper):
-        em    = '✅' if pnl > 0 else '❌'
-        mode  = '📝 PAPER' if paper else '💰 GERÇEK'
-        title = f"{em} {sym} KAPANDI │ PNL:{pnl:+.2f}"
+        mode  = 'PAPER' if paper else 'GERCEK'
+        kar   = 'KAR' if pnl > 0 else 'ZARAR'
+        title = f"{sym} KAPANDI {kar} {pnl:+.2f} USDT [{mode}]"
         msg   = (
-            f"{mode}\n"
+            f"{'KAZANC' if pnl > 0 else 'KAYIP'} | {sym}\n"
             f"Sebep: {reason}\n"
             f"PNL: {pnl:+.2f} USDT\n"
             f"Bakiye: {balance:.2f} USDT"
         )
-        cmc_link   = self._coin_to_cmc(sym)
-        bingx_link = self._coin_to_bingx(sym)
-        priority   = 'high' if pnl > 0 else 'default'
-        if self.ok:
-            try:
-                headers = {
-                    'Title'   : title,
-                    'Priority': priority,
-                    'Click'   : cmc_link,
-                    'Actions' : f"view, 📊 CoinMarketCap, {cmc_link}; view, 🔄 BingX, {bingx_link}"
-                }
-                requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), headers=headers, timeout=5)
-            except:
-                pass
-        else:
-            log.info(f"[NOTIF] {title}")
+        priority = 'high' if pnl > 0 else 'default'
+        self._ntfy_send(title, msg, sym, priority=priority)
 
     def daily_report(self, stats, paper):
         mode = '📝 PAPER' if paper else '💰 GERÇEK'
