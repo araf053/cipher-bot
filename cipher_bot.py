@@ -557,4 +557,647 @@ class ExitEngine:
             pts += 1; reasons.append('OBI_REV')
 
         # 4. HTF zayıflama
-        adx_
+        adx_val, _, _ = TA.adx(df_4h)
+        st_4h = TA.supertrend(df_4h)
+        st_d  = TA.supertrend(df_daily)
+        if adx_val < 18 or st_4h != st_d:
+            pts += 1; reasons.append('HTF_WEAK')
+
+        # 5. Funding aşırı
+        if funding > 0.05 or funding < -0.03:
+            pts += 2; reasons.append('FUND_EXT')
+
+        # 6. BTC çöküşü
+        btc_c = btc_1h['close'].values
+        if (btc_c[-1] - btc_c[-4]) / btc_c[-4] < -0.025:
+            pts += 3; reasons.append('BTC_CRASH')
+
+        # 7. Volatilite patlaması
+        if TA.atr(df_1h, 5) > TA.atr(df_1h, 20) * CONFIG['atr_explosion_mult']:
+            pts += 1; reasons.append('VOL_EXP')
+
+        # 8. Pozisyon çok eski
+        age_h = (datetime.now() - opened_at).total_seconds() / 3600
+        if age_h > CONFIG['max_position_age']:
+            pts += 1; reasons.append('TOO_OLD')
+
+        # 9. Yapısal trend bozuldu
+        struct = TA.structural_trend(df_4h, 3)
+        exp_struct = 'BULL' if side == 'LONG' else 'BEAR'
+        if struct not in [exp_struct, 'NEUTRAL']:
+            pts += 2; reasons.append('STRUCT_BREAK')
+
+        if pts >= 4: return 'FULL_EXIT', reasons
+        if pts >= 2: return 'PARTIAL_EXIT', reasons
+        if pts >= 1: return 'TIGHTEN_SL', reasons
+        return 'HOLD', reasons
+
+
+# ─────────────────────────────────────────────
+#  PAPER TRACKER
+# ─────────────────────────────────────────────
+class Paper:
+    def __init__(self, balance):
+        self.balance = balance
+        self.positions = {}   # sym → pos dict
+        self.trades    = []
+        self.start_bal = balance
+
+    def open(self, sym, side, qty, entry, sl, tp1, tp2, stage=1):
+        if sym in self.positions and stage == 1:
+            log.warning(f"[PAPER] {sym} zaten açık, atlanıyor")
+            return False
+        if self.balance < qty:
+            log.warning(f"[PAPER] Yetersiz bakiye: {self.balance:.2f}")
+            return False
+
+        if sym in self.positions and stage == 2:
+            # 2. kademe — mevcut pozisyona ekleme
+            pos = self.positions[sym]
+            pos['qty']    += qty
+            pos['stage']   = 2
+            self.balance  -= qty
+            log.info(f"[PAPER] STAGE2 {side} {sym} +{qty} USDT │ Toplam:{pos['qty']} USDT")
+            return True
+
+        self.positions[sym] = {
+            'side': side, 'entry': entry, 'qty': qty,
+            'sl': sl, 'tp1': tp1, 'tp2': tp2,
+            'tp1_hit': False, 'partial': False,
+            'opened': datetime.now(), 'stage': 1
+        }
+        self.balance -= qty
+        log.info(f"[PAPER] OPEN {side} {sym} @{entry:.4f} │ {qty} USDT │ SL:{sl:.4f}")
+        return True
+
+    def partial_close(self, sym, price, reason):
+        if sym not in self.positions: return 0
+        pos  = self.positions[sym]
+        half = pos['qty'] / 2
+        pnl  = half * (price - pos['entry']) / pos['entry'] * (1 if pos['side'] == 'LONG' else -1)
+        self.balance  += half + pnl
+        pos['qty']    -= half
+        pos['partial'] = True
+        pos['sl']      = pos['entry']  # SL başa çek
+        self.trades.append({'sym': sym, 'pnl': pnl, 'reason': f'PARTIAL'})
+        log.info(f"[PAPER] PARTIAL {sym} @{price:.4f} │ PNL:{pnl:+.2f}")
+        return pnl
+
+    def close(self, sym, price, reason):
+        if sym not in self.positions: return 0, 0, 0
+        pos  = self.positions.pop(sym)
+        pnl  = pos['qty'] * (price - pos['entry']) / pos['entry'] * (1 if pos['side'] == 'LONG' else -1)
+        self.balance += pos['qty'] + pnl
+        self.trades.append({'sym': sym, 'pnl': pnl, 'reason': reason})
+        em = '✅' if pnl > 0 else '❌'
+        log.info(f"[PAPER] CLOSE {em} {sym} @{price:.4f} │ {reason} │ PNL:{pnl:+.2f}")
+        return pnl, pos['entry'], price
+
+    def check_tp_sl(self, sym, price):
+        if sym not in self.positions: return None, 0, 0, 0
+        pos  = self.positions[sym]
+        side = pos['side']
+        hit_sl  = (side == 'LONG'  and price <= pos['sl']) or \
+                  (side == 'SHORT' and price >= pos['sl'])
+        hit_tp2 = (side == 'LONG'  and price >= pos['tp2']) or \
+                  (side == 'SHORT' and price <= pos['tp2'])
+        hit_tp1 = not pos['tp1_hit'] and (
+            (side == 'LONG'  and price >= pos['tp1']) or
+            (side == 'SHORT' and price <= pos['tp1'])
+        )
+
+        if hit_sl:
+            # SL fiyatını kullan, anlık fiyatı değil
+            sl_price = pos['sl']
+            pnl, ep, cp = self.close(sym, sl_price, 'SL')
+            return 'SL', pnl, ep, cp
+        if hit_tp2:
+            pnl, ep, cp = self.close(sym, price, 'TP2')
+            return 'TP2', pnl, ep, cp
+        if hit_tp1:
+            pos['tp1_hit'] = True
+            pos['sl'] = pos['entry']  # BE'ye çek
+            log.info(f"[PAPER] TP1 ✓ {sym} → SL başa çekildi")
+            return 'TP1', 0, 0, 0
+        return None, 0, 0, 0
+
+    def stats(self):
+        pnls = [t['pnl'] for t in self.trades]
+        wins = [p for p in pnls if p > 0]
+        return {
+            'count': len(pnls), 'winning': len(wins),
+            'losing': len(pnls) - len(wins),
+            'total_pnl': sum(pnls),
+            'win_rate': len(wins) / len(pnls) * 100 if pnls else 0,
+            'balance': self.balance
+        }
+
+
+# ─────────────────────────────────────────────
+#  BİLDİRİM
+# ─────────────────────────────────────────────
+class Notifier:
+    CMC = {
+        'BTC':'bitcoin','ETH':'ethereum','SOL':'solana','BNB':'bnb',
+        'AVAX':'avalanche-2','LINK':'chainlink','ARB':'arbitrum',
+        'OP':'optimism','DOGE':'dogecoin','APT':'aptos','SUI':'sui',
+        'DOT':'polkadot','MATIC':'matic-network','ATOM':'cosmos',
+        'INJ':'injective-protocol'
+    }
+
+    def __init__(self, ch):
+        self.ch = ch
+        self.ok = bool(ch)
+
+    def _cmc(self, sym):
+        coin = sym.replace('-USDT','')
+        slug = self.CMC.get(coin, coin.lower())
+        return f"https://coinmarketcap.com/currencies/{slug}/"
+
+    def _bingx(self, sym):
+        return f"https://bingx.com/en/futures/{sym.replace('-','_')}/"
+
+    def _send(self, title, body, sym=None, priority='default', tags='chart_with_upwards_trend'):
+        if not self.ok:
+            log.info(f"[NOTIF] {title}")
+            return
+        try:
+            h = {'Title': title, 'Priority': priority, 'Tags': tags}
+            if sym:
+                h['Click']   = self._cmc(sym)
+                h['Actions'] = f"view, CoinMarketCap, {self._cmc(sym)}; view, BingX, {self._bingx(sym)}"
+            requests.post(f'https://ntfy.sh/{self.ch}',
+                          data=body.encode('utf-8'), headers=h, timeout=5)
+        except Exception as e:
+            log.warning(f"Bildirim hatası: {e}")
+
+    def entry(self, sym, side, price, sl, tp1, tp2, qty, stage, paper):
+        mode = 'PAPER' if paper else 'CANLI'
+        em   = '🟢 LONG' if side == 'LONG' else '🔴 SHORT'
+        kd   = f'KADEME {stage}'
+        sl_pct = abs(price - sl) / price * 100
+        rr     = abs(tp2 - price) / abs(price - sl)
+        title  = f"{em} — {sym} [{kd}] [{mode}]"
+        body   = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 {sym}  |  {em}  |  {kd}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 Giriş  : {price:.4f}\n"
+            f"🎯 TP1    : {tp1:.4f}\n"
+            f"🎯 TP2    : {tp2:.4f}\n"
+            f"🛑 SL     : {sl:.4f}  (%{sl_pct:.1f})\n"
+            f"⚖️  R/R    : 1:{rr:.1f}\n"
+            f"💰 Miktar : {qty} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        self._send(title, body, sym, priority='high')
+
+    def exit_notif(self, sym, reason, pnl, balance, entry_p, close_p, paper):
+        mode  = 'PAPER' if paper else 'CANLI'
+        em    = '✅ KAZANC' if pnl > 0 else '❌ KAYIP'
+        title = f"{em} — {sym}  {pnl:+.2f} USDT [{mode}]"
+        body  = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 {sym}  |  {em}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔓 Giriş  : {entry_p:.4f}\n"
+            f"🔒 Çıkış  : {close_p:.4f}\n"
+            f"📊 Sebep  : {reason}\n"
+            f"💰 PNL    : {pnl:+.2f} USDT\n"
+            f"🏦 Bakiye : {balance:.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        self._send(title, body, sym, priority='high' if pnl > 0 else 'default')
+
+    def partial_notif(self, sym, reasons, pnl):
+        body = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ {sym} — KISMİ ÇIKIŞ\n"
+            f"📊 {', '.join(reasons)}\n"
+            f"💰 PNL: {pnl:+.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        self._send(f"⚠️ KISMİ ÇIKIŞ — {sym}", body, sym)
+
+    def stage2_notif(self, sym, side, price, qty, paper):
+        mode = 'PAPER' if paper else 'CANLI'
+        em   = '🟢' if side == 'LONG' else '🔴'
+        body = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"➕ {sym} | 2. KADEME GİRİŞ\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{em} {side} @{price:.4f}\n"
+            f"💰 Eklenen: {qty} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        self._send(f"➕ 2. KADEME — {sym} [{mode}]", body, sym, priority='high')
+
+    def daily_report(self, stats, paper):
+        mode  = 'PAPER' if paper else 'CANLI'
+        pnl   = stats['total_pnl']
+        em    = '📈' if pnl >= 0 else '📉'
+        title = f"{em} GÜNLÜK RAPOR [{mode}]"
+        body  = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{em} GÜNLÜK RAPOR [{mode}]\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 İşlem  : {stats['count']}\n"
+            f"✅ Kazanç : {stats['winning']}\n"
+            f"❌ Kayıp  : {stats['losing']}\n"
+            f"🎯 Win    : %{stats['win_rate']:.1f}\n"
+            f"💰 PNL    : {pnl:+.2f} USDT\n"
+            f"🏦 Bakiye : {stats['balance']:.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        self._send(title, body, tags='bar_chart')
+
+
+# ─────────────────────────────────────────────
+#  ANA BOT — CIPHER V3
+# ─────────────────────────────────────────────
+class CipherV3:
+    def __init__(self):
+        self.cfg    = CONFIG
+        self.api    = BingX(self.cfg['api_key'], self.cfg['api_secret'])
+        self.paper  = Paper(self.cfg['initial_balance'])
+        self.exit_e = ExitEngine()
+        self.sent   = Sentiment()
+        self.notif  = Notifier(self.cfg['ntfy_channel'])
+
+        self.is_paper      = self.cfg['paper_trading']
+        self.reentry_times = {}   # sym → son kapanma zamanı
+        self.oi_prev       = {}
+        self.btc_cache     = {}
+        self.last_reset    = date.today()
+
+        # 2. kademe bekleyenler: sym → signal bilgisi
+        self.pending_stage2 = {}
+
+        log.info("═" * 55)
+        log.info("  CIPHER V3 BAŞLADI")
+        log.info(f"  Mod     : {'📝 PAPER' if self.is_paper else '💰 CANLI'}")
+        log.info(f"  Coinler : {len(self.cfg['symbols'])} adet")
+        log.info(f"  Kaldıraç: {self.cfg['leverage']}x")
+        log.info("═" * 55)
+
+        self.notif._send(
+            "🚀 CIPHER V3 BAŞLADI",
+            f"{'📝 Paper' if self.is_paper else '💰 CANLI'}\n"
+            f"Coinler: {len(self.cfg['symbols'])} majör\n"
+            f"Kaldıraç: {self.cfg['leverage']}x\n"
+            f"Bakiye: {self.cfg['initial_balance']} USDT",
+            tags='rocket'
+        )
+
+    # ── BTC cache ─────────────────────────────
+    def _btc(self):
+        now = time.time()
+        if 'ts' in self.btc_cache and now - self.btc_cache['ts'] < 300:
+            return self.btc_cache['d']
+        d = {
+            '1h'   : self.api.klines('BTC-USDT', '1h',  200),
+            '4h'   : self.api.klines('BTC-USDT', '4h',  200),
+            'daily': self.api.klines('BTC-USDT', '1d',  200)
+        }
+        self.btc_cache = {'ts': now, 'd': d}
+        return d
+
+    # ── Günlük reset ──────────────────────────
+    def _daily_reset(self):
+        today = date.today()
+        if today > self.last_reset:
+            stats = self.paper.stats()
+            self.notif.daily_report(stats, self.is_paper)
+            self.last_reset = today
+            log.info("🔄 Günlük reset")
+
+    # ── Reentry engeli ────────────────────────
+    def _can_enter(self, sym):
+        last = self.reentry_times.get(sym, 0)
+        wait = self.cfg['reentry_wait_secs']
+        if time.time() - last < wait:
+            mins = int((wait - (time.time() - last)) / 60)
+            log.info(f"  ⏳ {sym} → {mins}dk bekleniyor")
+            return False
+        return True
+
+    # ── Sinyal analizi ────────────────────────
+    def _analyze(self, sym, btc):
+        try:
+            df_15m   = self.api.klines(sym, '15m', 100)
+            df_1h    = self.api.klines(sym, '1h',  200)
+            df_4h    = self.api.klines(sym, '4h',  200)
+            df_daily = self.api.klines(sym, '1d',  200)
+            ob       = self.api.orderbook(sym, 20)
+            oi       = self.api.open_interest(sym)
+            funding  = self.api.funding_rate(sym)
+            taker    = self.api.taker_ratio(sym)
+        except Exception as e:
+            log.warning(f"Veri hatası {sym}: {e}")
+            return None
+
+        score  = 0
+        passed = []
+        failed = []
+        c      = df_1h['close'].values
+        price  = float(c[-1])
+
+        # ── 1. HTF Trend (EMA + Supertrend + Yapısal) ──
+        trend, adx_val = TA.htf_trend(df_daily, df_4h)
+        if trend == 'BULL':
+            side = 'LONG'; score += 3; passed.append(f'HTF_BULL(ADX:{adx_val:.0f})')
+        elif trend == 'BEAR':
+            side = 'SHORT'; score += 3; passed.append(f'HTF_BEAR(ADX:{adx_val:.0f})')
+        else:
+            failed.append('HTF_NEUTRAL'); return None
+
+        # ── 2. Multi TF Konsensüs ──
+        mtf_score, sts = TA.mtf_consensus(df_15m, df_1h, df_4h, side)
+        if mtf_score >= 2:
+            score += mtf_score; passed.append(f'MTF({mtf_score}/3)')
+        elif mtf_score == 1:
+            passed.append(f'MTF_WEAK({mtf_score}/3)')
+        else:
+            failed.append(f'MTF_FAIL({sts[0]}/{sts[1]}/{sts[2]})'); return None
+
+        # ── 3. Yapısal Trend (HH/HL) ──
+        struct_4h = TA.structural_trend(df_4h, 4)
+        exp_s = 'BULL' if side == 'LONG' else 'BEAR'
+        if struct_4h == exp_s:
+            score += 2; passed.append(f'STRUCT_OK({struct_4h})')
+        elif struct_4h == 'NEUTRAL':
+            passed.append('STRUCT_NEUTRAL')
+        else:
+            failed.append(f'STRUCT_AGAINST({struct_4h})'); return None
+
+        # ── 4. RSI ──
+        rsi_good, rsi_val = TA.rsi_ok(df_1h, side)
+        if rsi_good:
+            score += 1; passed.append(f'RSI_OK({rsi_val:.0f})')
+        else:
+            failed.append(f'RSI_BAD({rsi_val:.0f})'); return None
+
+        # ── 5. CVD ──
+        cvd_val, cvd_pos, cvd_rising = TA.cvd(df_1h)
+        cvd_ok = (side == 'LONG' and cvd_pos and cvd_rising) or \
+                 (side == 'SHORT' and not cvd_pos and not cvd_rising)
+        if cvd_ok:
+            score += 1; passed.append(f'CVD_OK({cvd_val:.0f})')
+        else:
+            failed.append(f'CVD_FAIL')
+
+        # ── 6. OBI ──
+        obi_val = TA.obi(ob)
+        if side == 'LONG' and obi_val >= self.cfg['obi_threshold']:
+            score += 1; passed.append(f'OBI_BULL({obi_val:.2f})')
+        elif side == 'SHORT' and obi_val <= (1 / self.cfg['obi_threshold']):
+            score += 1; passed.append(f'OBI_BEAR({obi_val:.2f})')
+        else:
+            failed.append(f'OBI_NEUTRAL({obi_val:.2f})')
+
+        # ── 7. Taker Buy/Sell Oranı ──
+        if side == 'LONG' and taker > 0.52:
+            score += 1; passed.append(f'TAKER_BUY({taker:.2f})')
+        elif side == 'SHORT' and taker < 0.48:
+            score += 1; passed.append(f'TAKER_SELL({taker:.2f})')
+        else:
+            failed.append(f'TAKER_NEUTRAL({taker:.2f})')
+
+        # ── 8. Volume Spike ──
+        vol_ok, vol_ratio = TA.volume_spike(df_1h, self.cfg['volume_spike_mult'])
+        if vol_ok:
+            score += 1; passed.append(f'VOL({vol_ratio:.1f}x)')
+        else:
+            failed.append(f'VOL_LOW({vol_ratio:.1f}x)')
+
+        # ── 9. OI ──
+        prev_oi = self.oi_prev.get(sym, oi)
+        oi_chg  = (oi - prev_oi) / (prev_oi + 1e-9) * 100
+        self.oi_prev[sym] = oi
+        self.exit_e.update_oi(sym, oi)
+        if oi_chg >= self.cfg['oi_change_pct']:
+            score += 1; passed.append(f'OI_UP({oi_chg:+.1f}%)')
+        else:
+            failed.append(f'OI_FLAT({oi_chg:+.1f}%)')
+
+        # ── 10. Funding Rate ──
+        f_ok = self.cfg['funding_min'] <= funding <= self.cfg['funding_max']
+        if f_ok:
+            score += 1; passed.append(f'FUND_OK({funding:.4f})')
+        else:
+            failed.append(f'FUND_BAD({funding:.4f})'); return None
+
+        # ── 11. BTC Korelasyon ──
+        btc_c   = btc['1h']['close'].values
+        btc_chg = (btc_c[-1] - btc_c[-4]) / btc_c[-4]
+        if side == 'LONG' and btc_chg > self.cfg['btc_drop_limit']:
+            score += 1; passed.append(f'BTC_OK({btc_chg:+.2%})')
+        elif side == 'SHORT':
+            score += 1; passed.append('BTC_SHORT_OK')
+        else:
+            failed.append(f'BTC_DROP({btc_chg:+.2%})'); return None
+
+        # ── 12. Sentiment ──
+        try:
+            coin = sym.replace('-USDT', '')
+            fg   = self.sent.fear_greed()
+            news = self.sent.news(coin)
+            if self.sent.ok(side, fg['score'], news['score']):
+                score += 1; passed.append(f"SENT_OK(FG:{fg['score']})")
+            else:
+                failed.append(f"SENT_FAIL(FG:{fg['score']})")
+                return None
+        except:
+            passed.append('SENT_SKIP')
+
+        # ── Minimum skor ──
+        if score < 8:
+            log.debug(f"  {sym} skor düşük: {score} │ ❌ {', '.join(failed[:3])}")
+            return None
+
+        # ── Destek/Direnç Bazlı SL ──
+        sl = TA.support_resistance_sl(df_1h, df_4h, df_daily, side, price)
+
+        # ── TP Hesabı (Risk/Reward bazlı) ──
+        risk = abs(price - sl)
+        if side == 'LONG':
+            tp1 = price + risk * self.cfg['tp1_rr']
+            tp2 = price + risk * self.cfg['tp2_rr']
+        else:
+            tp1 = price - risk * self.cfg['tp1_rr']
+            tp2 = price - risk * self.cfg['tp2_rr']
+
+        return {
+            'sym': sym, 'side': side, 'price': price,
+            'sl': sl, 'tp1': tp1, 'tp2': tp2,
+            'score': score, 'passed': passed, 'failed': failed,
+            'funding': funding,
+            'df_1h': df_1h, 'df_4h': df_4h, 'df_daily': df_daily,
+            'df_15m': df_15m, 'ob': ob
+        }
+
+    # ── 2. Kademe kontrolü ────────────────────
+    def _check_stage2(self, btc):
+        """Bekleyen 2. kademe girişleri kontrol et"""
+        for sym, sig in list(self.pending_stage2.items()):
+            if sym not in self.paper.positions:
+                del self.pending_stage2[sym]
+                continue
+            try:
+                df_15m = self.api.klines(sym, '15m', 100)
+                df_1h  = self.api.klines(sym, '1h',  100)
+                if TA.trend_confirmed(df_15m, df_1h, sig['side']):
+                    qty   = self.cfg['entry2_usdt']
+                    price = float(self.api.ticker(sym).get('lastPrice', sig['price']))
+                    ok    = self.paper.open(sym, sig['side'], qty, price,
+                                            sig['sl'], sig['tp1'], sig['tp2'], stage=2)
+                    if ok:
+                        self.notif.stage2_notif(sym, sig['side'], price, qty, self.is_paper)
+                        log.info(f"  ➕ STAGE2 {sym} │ {qty} USDT @ {price:.4f}")
+                    del self.pending_stage2[sym]
+            except Exception as e:
+                log.warning(f"Stage2 {sym}: {e}")
+
+    # ── Pozisyon izleme ───────────────────────
+    def _monitor(self, btc):
+        for sym in list(self.paper.positions.keys()):
+            try:
+                price = float(self.api.ticker(sym).get('lastPrice', 0))
+                pos   = self.paper.positions.get(sym)
+                if not pos: continue
+
+                # TP/SL
+                reason, pnl, ep, cp = self.paper.check_tp_sl(sym, price)
+                if reason and reason != 'TP1':
+                    self.notif.exit_notif(sym, reason, pnl, self.paper.balance,
+                                          ep, cp, self.is_paper)
+                    self.reentry_times[sym] = time.time()
+                    if sym in self.pending_stage2:
+                        del self.pending_stage2[sym]
+                    continue
+
+                # Çıkış analizi
+                df_1h    = self.api.klines(sym, '1h',  100)
+                df_4h    = self.api.klines(sym, '4h',  100)
+                df_daily = self.api.klines(sym, '1d',  100)
+                ob       = self.api.orderbook(sym, 20)
+                funding  = self.api.funding_rate(sym)
+
+                sig, reasons = self.exit_e.score(
+                    sym, pos['side'], df_1h, df_daily, df_4h,
+                    ob, funding, btc['1h'], pos['opened']
+                )
+
+                if sig == 'FULL_EXIT':
+                    pnl, ep, cp = self.paper.close(sym, price, f"EXIT")
+                    self.notif.exit_notif(sym, ', '.join(reasons), pnl,
+                                          self.paper.balance, ep, cp, self.is_paper)
+                    self.reentry_times[sym] = time.time()
+                    log.info(f"  🚪 FULL EXIT {sym} │ {', '.join(reasons)}")
+
+                elif sig == 'PARTIAL_EXIT' and not pos.get('partial'):
+                    pnl = self.paper.partial_close(sym, price, ','.join(reasons))
+                    self.notif.partial_notif(sym, reasons, pnl)
+
+            except Exception as e:
+                log.warning(f"İzleme {sym}: {e}")
+
+    # ── Ana Tarama ────────────────────────────
+    def scan(self):
+        self._daily_reset()
+
+        log.info(f"\n{'═'*55}")
+        log.info(f"🔍 TARAMA │ {datetime.now().strftime('%H:%M:%S')} │ "
+                 f"Açık:{len(self.paper.positions)} │ "
+                 f"Bakiye:{self.paper.balance:.2f}")
+
+        try:
+            btc = self._btc()
+        except Exception as e:
+            log.error(f"BTC verisi: {e}"); return
+
+        # Pozisyon izle
+        self._monitor(btc)
+
+        # 2. kademe kontrol
+        self._check_stage2(btc)
+
+        # Max pozisyon
+        if len(self.paper.positions) >= self.cfg['max_positions']:
+            log.info(f"Max pozisyon dolu ({self.cfg['max_positions']})"); return
+
+        # Coin tarama
+        for sym in self.cfg['symbols']:
+            if sym in self.paper.positions: continue
+            if len(self.paper.positions) >= self.cfg['max_positions']: break
+            if not self._can_enter(sym): continue
+
+            log.info(f"  ▷ {sym}...")
+            result = self._analyze(sym, btc)
+
+            if result:
+                qty   = self.cfg['entry1_usdt']
+                price = result['price']
+                sl    = result['sl']
+                tp1   = result['tp1']
+                tp2   = result['tp2']
+                side  = result['side']
+                sl_pct = abs(price - sl) / price * 100
+
+                log.info(
+                    f"  ✅ {sym} {side} │ Skor:{result['score']} │ "
+                    f"SL:%{sl_pct:.1f} │ {qty}USDT\n"
+                    f"     {', '.join(result['passed'])}"
+                )
+
+                if self.is_paper:
+                    ok = self.paper.open(sym, side, qty, price, sl, tp1, tp2, stage=1)
+                    if ok:
+                        self.notif.entry(sym, side, price, sl, tp1, tp2, qty, 1, True)
+                        # 2. kademe için kaydet
+                        self.pending_stage2[sym] = result
+                else:
+                    self.api.set_leverage(sym, self.cfg['leverage'])
+                    self.api.place_order(
+                        sym, 'BUY' if side == 'LONG' else 'SELL',
+                        qty, sl=sl, tp=tp1, paper=False
+                    )
+                    self.notif.entry(sym, side, price, sl, tp1, tp2, qty, 1, False)
+                    self.pending_stage2[sym] = result
+            else:
+                log.info(f"  ✕ {sym} → pas")
+
+            time.sleep(1)
+
+        # Özet
+        s = self.paper.stats()
+        log.info(
+            f"📊 Açık:{len(self.paper.positions)} │ "
+            f"WR:%{s['win_rate']:.0f} │ "
+            f"PNL:{s['total_pnl']:+.2f}"
+        )
+
+    # ── Döngü ────────────────────────────────
+    def run(self):
+        interval = self.cfg['scan_interval_minutes'] * 60
+        while True:
+            try:
+                self.scan()
+            except Exception as e:
+                log.error(f"Tarama hatası: {e}")
+                self.notif._send("⚠️ HATA", str(e), tags='warning')
+            log.info(f"💤 {self.cfg['scan_interval_minutes']}dk...\n")
+            time.sleep(interval)
+
+
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    bot = CipherV3()
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        s = bot.paper.stats()
+        bot.notif._send("⏹ DURDURULDU",
+                        f"PNL:{s['total_pnl']:+.2f} USDT\nBakiye:{s['balance']:.2f}")
+        log.info("Bot durduruldu")
+
