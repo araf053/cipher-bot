@@ -15,6 +15,11 @@
 import hashlib, hmac, time, logging, os, requests
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import io
 from datetime import datetime, date
 from config import CONFIG
 
@@ -694,7 +699,7 @@ class Paper:
 
 
 # ─────────────────────────────────────────────
-#  BİLDİRİM
+#  BİLDİRİM — GELİŞMİŞ NTFY
 # ─────────────────────────────────────────────
 class Notifier:
     CMC = {
@@ -706,8 +711,9 @@ class Notifier:
     }
 
     def __init__(self, ch):
-        self.ch = ch
-        self.ok = bool(ch)
+        self.ch  = ch
+        self.ok  = bool(ch)
+        self.bal_history = []   # Bakiye geçmişi → günlük grafik için
 
     def _cmc(self, sym):
         coin = sym.replace('-USDT','')
@@ -717,6 +723,7 @@ class Notifier:
     def _bingx(self, sym):
         return f"https://bingx.com/en/futures/{sym.replace('-','_')}/"
 
+    # ── Düz metin bildirimi ───────────────────
     def _send(self, title, body, sym=None, priority='default', tags='chart_with_upwards_trend'):
         if not self.ok:
             log.info(f"[NOTIF] {title}")
@@ -725,90 +732,358 @@ class Notifier:
             h = {'Title': title, 'Priority': priority, 'Tags': tags}
             if sym:
                 h['Click']   = self._cmc(sym)
-                h['Actions'] = f"view, CoinMarketCap, {self._cmc(sym)}; view, BingX, {self._bingx(sym)}"
-            requests.post(f'https://ntfy.sh/{self.ch}',
-                          data=body.encode('utf-8'), headers=h, timeout=5)
+                h['Actions'] = (
+                    f"view, 📊 CoinMarketCap, {self._cmc(sym)}; "
+                    f"view, 🔄 BingX, {self._bingx(sym)}"
+                )
+            requests.post(
+                f'https://ntfy.sh/{self.ch}',
+                data=body.encode('utf-8'),
+                headers=h, timeout=5
+            )
         except Exception as e:
             log.warning(f"Bildirim hatası: {e}")
 
-    def entry(self, sym, side, price, sl, tp1, tp2, qty, stage, paper):
-        mode = 'PAPER' if paper else 'CANLI'
-        em   = '🟢 LONG' if side == 'LONG' else '🔴 SHORT'
-        kd   = f'KADEME {stage}'
+    # ── PNG grafik bildirimi ──────────────────
+    def _send_image(self, title, img_bytes, sym=None, priority='default'):
+        if not self.ok: return
+        try:
+            h = {
+                'Title'   : title,
+                'Priority': priority,
+                'Filename': 'chart.png',
+                'Tags'    : 'bar_chart'
+            }
+            if sym:
+                h['Click']   = self._cmc(sym)
+                h['Actions'] = (
+                    f"view, 📊 CoinMarketCap, {self._cmc(sym)}; "
+                    f"view, 🔄 BingX, {self._bingx(sym)}"
+                )
+            requests.post(
+                f'https://ntfy.sh/{self.ch}',
+                data=img_bytes,
+                headers=h, timeout=10
+            )
+        except Exception as e:
+            log.warning(f"Görsel bildirim hatası: {e}")
+
+    # ── Giriş grafiği ─────────────────────────
+    def _entry_chart(self, sym, side, price, sl, tp1, tp2, passed, failed, score):
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5),
+                                     gridspec_kw={'width_ratios': [1, 1.6]})
+            fig.patch.set_facecolor('#0d1117')
+
+            # ── Sol: Fiyat Seviyeleri ──
+            ax = axes[0]
+            ax.set_facecolor('#0d1117')
+            ax.set_xlim(0, 1)
+
+            is_long  = side == 'LONG'
+            clr_main = '#00c853' if is_long else '#ff1744'
+            clr_tp   = '#00e676'
+            clr_sl   = '#ff1744'
+            clr_tp2  = '#69f0ae'
+
+            levels = [
+                (tp2,   f'TP2  {tp2:.4f}',   clr_tp2,  0.95),
+                (tp1,   f'TP1  {tp1:.4f}',   clr_tp,   0.75),
+                (price, f'GİRİŞ {price:.4f}', '#ffffff', 0.50),
+                (sl,    f'SL   {sl:.4f}',    clr_sl,   0.25),
+            ] if is_long else [
+                (sl,    f'SL   {sl:.4f}',    clr_sl,   0.95),
+                (price, f'GİRİŞ {price:.4f}', '#ffffff', 0.75),
+                (tp1,   f'TP1  {tp1:.4f}',   clr_tp,   0.50),
+                (tp2,   f'TP2  {tp2:.4f}',   clr_tp2,  0.25),
+            ]
+
+            for _, label, color, y in levels:
+                ax.axhline(y=y, color=color, linewidth=1.5, linestyle='--', alpha=0.8)
+                ax.text(0.05, y + 0.02, label, color=color,
+                        fontsize=9, fontweight='bold', va='bottom',
+                        fontfamily='monospace')
+
+            risk  = abs(price - sl)
+            rr    = abs(tp2 - price) / (risk + 1e-9)
+            sl_pct = risk / price * 100
+            mode_txt = 'LONG 🟢' if is_long else 'SHORT 🔴'
+
+            ax.text(0.5, 0.01,
+                    f"{mode_txt}  |  R/R 1:{rr:.1f}  |  SL %{sl_pct:.1f}",
+                    color=clr_main, fontsize=8, ha='center', va='bottom',
+                    transform=ax.transAxes, fontweight='bold')
+
+            ax.set_title(f'{sym}', color='white', fontsize=12, fontweight='bold', pad=8)
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values(): spine.set_edgecolor('#30363d')
+
+            # ── Sağ: Sinyal Skoru ──
+            ax2 = axes[1]
+            ax2.set_facecolor('#0d1117')
+            ax2.set_xlim(0, 1); ax2.set_ylim(0, 1)
+            ax2.set_xticks([]); ax2.set_yticks([])
+            for spine in ax2.spines.values(): spine.set_edgecolor('#30363d')
+
+            ax2.set_title(f'Sinyal Skoru: {score}', color='#f0f6fc',
+                          fontsize=11, fontweight='bold', pad=8)
+
+            # Geçen sinyaller
+            y_pos = 0.93
+            ax2.text(0.05, y_pos, '✅ GEÇEN SİNYALLER', color='#00c853',
+                     fontsize=8, fontweight='bold', transform=ax2.transAxes)
+            y_pos -= 0.07
+            for p in passed[:8]:
+                ax2.text(0.05, y_pos, f'  ✓ {p}', color='#8b949e',
+                         fontsize=7.5, transform=ax2.transAxes, fontfamily='monospace')
+                y_pos -= 0.065
+
+            # Kalan sinyaller
+            if failed:
+                y_pos -= 0.02
+                ax2.text(0.05, y_pos, '❌ KALAN SİNYALLER', color='#ff1744',
+                         fontsize=8, fontweight='bold', transform=ax2.transAxes)
+                y_pos -= 0.07
+                for f in failed[:5]:
+                    ax2.text(0.05, y_pos, f'  ✗ {f}', color='#6e7681',
+                             fontsize=7.5, transform=ax2.transAxes, fontfamily='monospace')
+                    y_pos -= 0.065
+
+            # Skor barı
+            total_possible = score + len(failed)
+            bar_w = score / max(total_possible, 1)
+            ax2.add_patch(mpatches.FancyBboxPatch(
+                (0.05, 0.04), 0.9, 0.06,
+                boxstyle='round,pad=0.01',
+                facecolor='#21262d', edgecolor='#30363d'
+            ))
+            ax2.add_patch(mpatches.FancyBboxPatch(
+                (0.05, 0.04), 0.9 * bar_w, 0.06,
+                boxstyle='round,pad=0.01',
+                facecolor=clr_main, edgecolor='none', alpha=0.8
+            ))
+            ax2.text(0.5, 0.07, f'{score} / {total_possible}',
+                     color='white', fontsize=8, ha='center', va='center',
+                     transform=ax2.transAxes, fontweight='bold')
+
+            plt.tight_layout(pad=1.5)
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=120, bbox_inches='tight',
+                        facecolor='#0d1117')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.read()
+        except Exception as e:
+            log.warning(f"Giriş grafiği hatası: {e}")
+            return None
+
+    # ── Günlük rapor grafiği ──────────────────
+    def _daily_chart(self, trades, start_bal, current_bal):
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+            fig.patch.set_facecolor('#0d1117')
+
+            # ── Sol: Bakiye eğrisi ──
+            ax1 = axes[0]
+            ax1.set_facecolor('#161b22')
+
+            bal = start_bal
+            bal_curve = [bal]
+            for t in trades:
+                bal += t['pnl']
+                bal_curve.append(bal)
+
+            xs = list(range(len(bal_curve)))
+            colors_line = ['#00c853' if b >= start_bal else '#ff1744'
+                           for b in bal_curve]
+
+            for i in range(len(xs)-1):
+                clr = '#00c853' if bal_curve[i+1] >= bal_curve[i] else '#ff1744'
+                ax1.plot(xs[i:i+2], bal_curve[i:i+2], color=clr, linewidth=2)
+
+            ax1.fill_between(xs, bal_curve, start_bal,
+                             where=[b >= start_bal for b in bal_curve],
+                             alpha=0.15, color='#00c853')
+            ax1.fill_between(xs, bal_curve, start_bal,
+                             where=[b < start_bal for b in bal_curve],
+                             alpha=0.15, color='#ff1744')
+
+            ax1.axhline(y=start_bal, color='#8b949e', linestyle='--',
+                        linewidth=1, alpha=0.5)
+            ax1.set_title('Bakiye Grafiği', color='white', fontsize=10,
+                          fontweight='bold')
+            ax1.set_facecolor('#161b22')
+            ax1.tick_params(colors='#8b949e', labelsize=7)
+            ax1.yaxis.label.set_color('#8b949e')
+            for spine in ax1.spines.values(): spine.set_edgecolor('#30363d')
+            ax1.set_xlabel('İşlem #', color='#8b949e', fontsize=8)
+            ax1.set_ylabel('USDT', color='#8b949e', fontsize=8)
+
+            # ── Sağ: İşlem dağılımı ──
+            ax2 = axes[1]
+            ax2.set_facecolor('#161b22')
+
+            pnls   = [t['pnl'] for t in trades]
+            wins   = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+
+            if pnls:
+                # Bar chart — her işlem
+                bar_colors = ['#00c853' if p > 0 else '#ff1744' for p in pnls]
+                xs2 = list(range(len(pnls)))
+                bars = ax2.bar(xs2, pnls, color=bar_colors, alpha=0.8, width=0.6)
+                ax2.axhline(y=0, color='#8b949e', linewidth=0.8, alpha=0.5)
+
+                # İstatistik kutusu
+                wr   = len(wins) / len(pnls) * 100
+                total = sum(pnls)
+                avg_w = sum(wins) / len(wins) if wins else 0
+                avg_l = sum(losses) / len(losses) if losses else 0
+
+                stats_txt = (
+                    f"İşlem: {len(pnls)}   Win: %{wr:.0f}\n"
+                    f"Ort Kazanç: +{avg_w:.2f}$\n"
+                    f"Ort Kayıp : {avg_l:.2f}$\n"
+                    f"Toplam PNL: {total:+.2f}$"
+                )
+                ax2.text(0.98, 0.98, stats_txt,
+                         transform=ax2.transAxes,
+                         color='#f0f6fc', fontsize=7.5,
+                         va='top', ha='right',
+                         fontfamily='monospace',
+                         bbox=dict(boxstyle='round,pad=0.4',
+                                   facecolor='#21262d',
+                                   edgecolor='#30363d', alpha=0.9))
+
+            ax2.set_title('İşlem Dağılımı', color='white', fontsize=10,
+                          fontweight='bold')
+            ax2.tick_params(colors='#8b949e', labelsize=7)
+            for spine in ax2.spines.values(): spine.set_edgecolor('#30363d')
+            ax2.set_xlabel('İşlem #', color='#8b949e', fontsize=8)
+            ax2.set_ylabel('PNL (USDT)', color='#8b949e', fontsize=8)
+
+            plt.tight_layout(pad=1.5)
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=120, bbox_inches='tight',
+                        facecolor='#0d1117')
+            plt.close(fig)
+            buf.seek(0)
+            return buf.read()
+        except Exception as e:
+            log.warning(f"Rapor grafiği hatası: {e}")
+            return None
+
+    # ── GİRİŞ BİLDİRİMİ ─────────────────────
+    def entry(self, sym, side, price, sl, tp1, tp2, qty, stage, paper, passed=None, failed=None, score=0):
+        mode   = 'PAPER' if paper else 'CANLI'
+        em     = '🟢 LONG' if side == 'LONG' else '🔴 SHORT'
+        kd     = f'KADEME {stage}'
         sl_pct = abs(price - sl) / price * 100
-        rr     = abs(tp2 - price) / abs(price - sl)
+        rr     = abs(tp2 - price) / (abs(price - sl) + 1e-9)
         title  = f"{em} — {sym} [{kd}] [{mode}]"
-        body   = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+
+        body = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 {sym}  |  {em}  |  {kd}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 Giriş  : {price:.4f}\n"
-            f"🎯 TP1    : {tp1:.4f}\n"
-            f"🎯 TP2    : {tp2:.4f}\n"
-            f"🛑 SL     : {sl:.4f}  (%{sl_pct:.1f})\n"
-            f"⚖️  R/R    : 1:{rr:.1f}\n"
-            f"💰 Miktar : {qty} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 Giriş : {price:.4f}\n"
+            f"🎯 TP1   : {tp1:.4f}\n"
+            f"🎯 TP2   : {tp2:.4f}\n"
+            f"🛑 SL    : {sl:.4f}  (%{sl_pct:.1f})\n"
+            f"⚖️  R/R   : 1:{rr:.1f}\n"
+            f"💰 Miktar: {qty} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━"
         )
+
+        # Grafik üret ve gönder
+        if passed is not None:
+            img = self._entry_chart(sym, side, price, sl, tp1, tp2,
+                                    passed, failed or [], score)
+            if img:
+                self._send_image(title, img, sym, priority='high')
+                return
+
         self._send(title, body, sym, priority='high')
 
+    # ── ÇIKIŞ BİLDİRİMİ ─────────────────────
     def exit_notif(self, sym, reason, pnl, balance, entry_p, close_p, paper):
-        mode  = 'PAPER' if paper else 'CANLI'
-        em    = '✅ KAZANC' if pnl > 0 else '❌ KAYIP'
-        title = f"{em} — {sym}  {pnl:+.2f} USDT [{mode}]"
-        body  = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+        mode   = 'PAPER' if paper else 'CANLI'
+        em     = '✅ KAZANÇ' if pnl > 0 else '❌ KAYIP'
+        chg    = (close_p - entry_p) / entry_p * 100
+        title  = f"{em} — {sym}  {pnl:+.2f} USDT [{mode}]"
+        body   = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 {sym}  |  {em}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔓 Giriş  : {entry_p:.4f}\n"
-            f"🔒 Çıkış  : {close_p:.4f}\n"
-            f"📊 Sebep  : {reason}\n"
-            f"💰 PNL    : {pnl:+.2f} USDT\n"
-            f"🏦 Bakiye : {balance:.2f} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔓 Giriş : {entry_p:.4f}\n"
+            f"🔒 Çıkış : {close_p:.4f}  ({chg:+.2f}%)\n"
+            f"📊 Sebep : {reason}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 PNL   : {pnl:+.2f} USDT\n"
+            f"🏦 Bakiye: {balance:.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━"
         )
-        self._send(title, body, sym, priority='high' if pnl > 0 else 'default')
+        priority = 'high' if pnl > 0 else 'default'
+        tags     = 'white_check_mark' if pnl > 0 else 'x'
+        self._send(title, body, sym, priority=priority, tags=tags)
 
+    # ── KISMİ ÇIKIŞ ──────────────────────────
     def partial_notif(self, sym, reasons, pnl):
         body = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️ {sym} — KISMİ ÇIKIŞ\n"
-            f"📊 {', '.join(reasons)}\n"
-            f"💰 PNL: {pnl:+.2f} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Sebep : {', '.join(reasons)}\n"
+            f"💰 PNL   : {pnl:+.2f} USDT\n"
+            f"🔒 SL başa çekildi\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━"
         )
-        self._send(f"⚠️ KISMİ ÇIKIŞ — {sym}", body, sym)
+        self._send(f"⚠️ KISMİ ÇIKIŞ — {sym}", body, sym, tags='warning')
 
+    # ── 2. KADEME ────────────────────────────
     def stage2_notif(self, sym, side, price, qty, paper):
         mode = 'PAPER' if paper else 'CANLI'
         em   = '🟢' if side == 'LONG' else '🔴'
         body = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"➕ {sym} | 2. KADEME GİRİŞ\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{em} {side} @{price:.4f}\n"
-            f"💰 Eklenen: {qty} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{em} {side} @ {price:.4f}\n"
+            f"💰 Eklenen : {qty} USDT\n"
+            f"📊 Trend onaylandı ✅\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         self._send(f"➕ 2. KADEME — {sym} [{mode}]", body, sym, priority='high')
 
-    def daily_report(self, stats, paper):
+    # ── GÜNLÜK RAPOR ─────────────────────────
+    def daily_report(self, stats, paper, trades=None, start_bal=None):
         mode  = 'PAPER' if paper else 'CANLI'
         pnl   = stats['total_pnl']
         em    = '📈' if pnl >= 0 else '📉'
+        wr    = stats['win_rate']
         title = f"{em} GÜNLÜK RAPOR [{mode}]"
-        body  = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+
+        body = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{em} GÜNLÜK RAPOR [{mode}]\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now().strftime('%d %B %Y')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 İşlem  : {stats['count']}\n"
             f"✅ Kazanç : {stats['winning']}\n"
             f"❌ Kayıp  : {stats['losing']}\n"
-            f"🎯 Win    : %{stats['win_rate']:.1f}\n"
+            f"🎯 Win    : %{wr:.1f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 PNL    : {pnl:+.2f} USDT\n"
             f"🏦 Bakiye : {stats['balance']:.2f} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━"
         )
+        # Grafik üret
+        if trades and start_bal:
+            img = self._daily_chart(trades, start_bal, stats['balance'])
+            if img:
+                self._send_image(title, img, priority='default')
+                return
+
         self._send(title, body, tags='bar_chart')
 
 
@@ -867,7 +1142,9 @@ class CipherV3:
         today = date.today()
         if today > self.last_reset:
             stats = self.paper.stats()
-            self.notif.daily_report(stats, self.is_paper)
+            self.notif.daily_report(stats, self.is_paper,
+                                    trades=self.paper.trades,
+                                    start_bal=self.paper.start_bal)
             self.last_reset = today
             log.info("🔄 Günlük reset")
 
@@ -1153,7 +1430,9 @@ class CipherV3:
                 if self.is_paper:
                     ok = self.paper.open(sym, side, qty, price, sl, tp1, tp2, stage=1)
                     if ok:
-                        self.notif.entry(sym, side, price, sl, tp1, tp2, qty, 1, True)
+                        self.notif.entry(sym, side, price, sl, tp1, tp2, qty, 1, True,
+                                        passed=result['passed'], failed=result['failed'],
+                                        score=result['score'])
                         # 2. kademe için kaydet
                         self.pending_stage2[sym] = result
                 else:
@@ -1200,4 +1479,3 @@ if __name__ == '__main__':
         bot.notif._send("⏹ DURDURULDU",
                         f"PNL:{s['total_pnl']:+.2f} USDT\nBakiye:{s['balance']:.2f}")
         log.info("Bot durduruldu")
-
