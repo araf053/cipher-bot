@@ -1,13 +1,15 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║           CIPHER V2 — Gelişmiş Futures Trading Bot           ║
-║                                                              ║
-║  GİRİŞ  : HTF Trend + Breakout + Volume + OI + Funding      ║
-║           + OBI + CVD + Liquidation + Whale + BTC Korelasyon ║
-║  ÇIKIŞ  : OI düşüş + CVD div + OBI dönüş + HTF zayıflama   ║
-║  RİSK   : Dinamik boyut + Günlük limit + Tekrar giriş engeli ║
-║  KOİNLER: BTC + ETH + SOL + BNB                             ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║              CIPHER V3 — Smart Futures Trading Bot              ║
+║                                                                  ║
+║  YENİ: • 15 Majör Coin (LONG + SHORT)                           ║
+║        • Kademeli Giriş (25 + 75 USDT)                         ║
+║        • Destek/Direnç Bazlı Dinamik SL                         ║
+║        • Swing High/Low + Pivot + Order Block                   ║
+║        • HH/HL Yapısal Trend Tespiti                            ║
+║        • Taker Buy/Sell Ratio                                    ║
+║        • Fear & Greed + CryptoPanic Sentiment                   ║
+╚══════════════════════════════════════════════════════════════════╝
 """
 
 import hashlib, hmac, time, logging, os, requests
@@ -16,96 +18,76 @@ import pandas as pd
 from datetime import datetime, date
 from config import CONFIG
 
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s │ %(levelname)-7s │ %(message)s',
     datefmt='%H:%M:%S',
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger('CIPHER_V2')
+log = logging.getLogger('CIPHER_V3')
 
 
 # ─────────────────────────────────────────────
-#  SENTIMENT ANALİZİ
+#  SENTIMENT
 # ─────────────────────────────────────────────
-class SentimentAnalyzer:
+class Sentiment:
     def __init__(self):
-        self.cache = {}
+        self._cache = {}
 
-    def _cached(self, key, ttl=900):
-        """Cache - 15 dakika geçerli"""
-        if key in self.cache:
-            val, ts = self.cache[key]
+    def _get(self, key, ttl=900):
+        if key in self._cache:
+            v, ts = self._cache[key]
             if time.time() - ts < ttl:
-                return val
+                return v
         return None
 
+    def _set(self, key, val):
+        self._cache[key] = (val, time.time())
+        return val
+
     def fear_greed(self):
-        """Fear & Greed Index — 0 korku, 100 açgözlülük"""
-        cached = self._cached('fg')
-        if cached: return cached
+        c = self._get('fg')
+        if c: return c
         try:
-            r = requests.get('https://api.alternative.me/fng/?limit=1', timeout=5)
-            d = r.json()
-            val   = int(d['data'][0]['value'])
-            label = d['data'][0]['value_classification']
-            result = {'score': val, 'label': label}
-            self.cache['fg'] = (result, time.time())
-            log.info(f"  Fear&Greed: {val} ({label})")
-            return result
-        except Exception as e:
-            log.warning(f"Fear&Greed hatası: {e}")
+            r = requests.get('https://api.alternative.me/fng/?limit=1', timeout=5).json()
+            v = int(r['data'][0]['value'])
+            label = r['data'][0]['value_classification']
+            return self._set('fg', {'score': v, 'label': label})
+        except:
             return {'score': 50, 'label': 'Neutral'}
 
-    def cryptopanic(self, coin='BTC'):
-        """CryptoPanic — haber sentiment"""
-        cached = self._cached(f'cp_{coin}')
-        if cached: return cached
+    def news(self, coin):
+        key = f'cp_{coin}'
+        c = self._get(key)
+        if c: return c
         try:
             url = f'https://cryptopanic.com/api/free/v1/posts/?auth_token=free&currencies={coin}&filter=hot'
-            r   = requests.get(url, timeout=5)
-            d   = r.json()
-            results = d.get('results', [])[:10]
-            pos = sum(1 for x in results if x.get('kind') == 'news' and x.get('votes', {}).get('positive', 0) > x.get('votes', {}).get('negative', 0))
-            neg = sum(1 for x in results if x.get('kind') == 'news' and x.get('votes', {}).get('negative', 0) > x.get('votes', {}).get('positive', 0))
-            total = len(results) or 1
-            score = pos / total  # 0-1 arası, 1 = tam pozitif
-            result = {'positive': pos, 'negative': neg, 'score': score, 'total': total}
-            self.cache[f'cp_{coin}'] = (result, time.time())
-            log.info(f"  CryptoPanic {coin}: +{pos}/-{neg} (skor:{score:.2f})")
-            return result
-        except Exception as e:
-            log.warning(f"CryptoPanic hatası: {e}")
-            return {'positive': 0, 'negative': 0, 'score': 0.5, 'total': 0}
+            d = requests.get(url, timeout=5).json().get('results', [])[:10]
+            pos = sum(1 for x in d if x.get('votes', {}).get('positive', 0) > x.get('votes', {}).get('negative', 0))
+            total = len(d) or 1
+            score = pos / total
+            return self._set(key, {'score': score, 'pos': pos, 'total': total})
+        except:
+            return {'score': 0.5, 'pos': 0, 'total': 0}
 
-    def sentiment_ok(self, side, fg_score, cp_score):
-        """Sentiment işlem yönüyle uyumlu mu?"""
+    def ok(self, side, fg, news_score):
         if side == 'LONG':
-            fg_ok = fg_score < 75   # Aşırı açgözlülük yoksa LONG açılabilir
-            cp_ok = cp_score >= 0.4  # Haberler çok negatif değilse
-            return fg_ok and cp_ok
-        else:  # SHORT
-            fg_ok = fg_score > 25   # Aşırı korku yoksa SHORT açılabilir
-            cp_ok = cp_score <= 0.6  # Haberler çok pozitif değilse
-            return fg_ok and cp_ok
+            return fg < 80 and news_score >= 0.35
+        else:
+            return fg > 20 and news_score <= 0.65
 
 
 # ─────────────────────────────────────────────
-#  BINGX API CLIENT
+#  BINGX API
 # ─────────────────────────────────────────────
-class BingXClient:
+class BingX:
     BASE = 'https://open-api.bingx.com'
 
-    def __init__(self, key, secret, paper=True):
-        self.key    = key
+    def __init__(self, key, secret):
+        self.key = key
         self.secret = secret
-        self.paper  = paper
-        self.sess   = requests.Session()
+        self.sess = requests.Session()
         self.sess.headers.update({'X-BX-APIKEY': key})
-        log.info(f"BingX │ {'📝 PAPER' if paper else '💰 GERÇEK'}")
 
     def _sign(self, p):
         q = '&'.join(f'{k}={v}' for k, v in sorted(p.items()))
@@ -116,10 +98,9 @@ class BingXClient:
         p['timestamp'] = int(time.time() * 1000)
         p['signature'] = self._sign(p)
         r = self.sess.get(f'{self.BASE}{path}', params=p, timeout=10)
-        r.raise_for_status()
         d = r.json()
         if d.get('code', 0) != 0:
-            raise Exception(f"API: {d.get('msg')}")
+            raise Exception(f"API {path}: {d.get('msg')}")
         return d.get('data', d)
 
     def _post(self, path, p=None):
@@ -127,16 +108,14 @@ class BingXClient:
         p['timestamp'] = int(time.time() * 1000)
         p['signature'] = self._sign(p)
         r = self.sess.post(f'{self.BASE}{path}', params=p, timeout=10)
-        r.raise_for_status()
         d = r.json()
         if d.get('code', 0) != 0:
-            raise Exception(f"API: {d.get('msg')}")
+            raise Exception(f"API {path}: {d.get('msg')}")
         return d.get('data', d)
 
-    def klines(self, sym, interval, limit=100):
-        d = self._get('/openApi/swap/v3/quote/klines', {
-            'symbol': sym, 'interval': interval, 'limit': limit
-        })
+    def klines(self, sym, interval, limit=200):
+        d = self._get('/openApi/swap/v3/quote/klines',
+                      {'symbol': sym, 'interval': interval, 'limit': limit})
         df = pd.DataFrame(d, columns=['time','open','high','low','close','volume','_','_2'])
         df = df[['time','open','high','low','close','volume']].astype(float)
         df['time'] = pd.to_datetime(df['time'], unit='ms')
@@ -147,9 +126,7 @@ class BingXClient:
         return d[0] if isinstance(d, list) else d
 
     def orderbook(self, sym, depth=20):
-        return self._get('/openApi/swap/v2/quote/depth', {
-            'symbol': sym, 'limit': depth
-        })
+        return self._get('/openApi/swap/v2/quote/depth', {'symbol': sym, 'limit': depth})
 
     def open_interest(self, sym):
         try:
@@ -166,19 +143,30 @@ class BingXClient:
         except:
             return 0.0
 
+    def taker_ratio(self, sym):
+        """Taker Buy/Sell Oranı — alıcı/satıcı dengesi"""
+        try:
+            d = self._get('/openApi/swap/v2/quote/takerlongshortRatio',
+                          {'symbol': sym, 'period': '1h', 'limit': 5})
+            if not d: return 0.5
+            buy_vol  = float(d[-1].get('buyVol', 0.5))
+            sell_vol = float(d[-1].get('sellVol', 0.5))
+            ratio = buy_vol / (buy_vol + sell_vol + 1e-9)
+            return ratio  # 0.5+ → alıcılar baskın, 0.5- → satıcılar baskın
+        except:
+            return 0.5
+
     def set_leverage(self, sym, lev):
         try:
-            self._post('/openApi/swap/v2/trade/leverage', {
-                'symbol': sym, 'side': 'LONG', 'leverage': lev
-            })
-            self._post('/openApi/swap/v2/trade/leverage', {
-                'symbol': sym, 'side': 'SHORT', 'leverage': lev
-            })
+            self._post('/openApi/swap/v2/trade/leverage',
+                       {'symbol': sym, 'side': 'LONG', 'leverage': lev})
+            self._post('/openApi/swap/v2/trade/leverage',
+                       {'symbol': sym, 'side': 'SHORT', 'leverage': lev})
         except Exception as e:
             log.warning(f"Kaldıraç {sym}: {e}")
 
-    def place_order(self, sym, side, qty, sl=None, tp=None):
-        path = '/openApi/swap/v2/trade/order/test' if self.paper else '/openApi/swap/v2/trade/order'
+    def place_order(self, sym, side, qty, sl=None, tp=None, paper=True):
+        path = '/openApi/swap/v2/trade/order/test' if paper else '/openApi/swap/v2/trade/order'
         pos  = 'LONG' if side == 'BUY' else 'SHORT'
         r    = self._post(path, {
             'symbol': sym, 'side': side,
@@ -192,117 +180,142 @@ class BingXClient:
                     self._post(path, {
                         'symbol': sym, 'side': cs,
                         'positionSide': pos, 'type': otype,
-                        'stopPrice': price, 'quoteOrderQty': qty,
+                        'stopPrice': round(price, 4),
                         'closePosition': True
                     })
                 except Exception as e:
-                    log.warning(f"Koşullu emir: {e}")
+                    log.warning(f"Koşullu emir {sym}: {e}")
         return r
 
 
 # ─────────────────────────────────────────────
-#  TEKNİK ANALİZ ARAÇLARI
+#  TEKNİK ANALİZ
 # ─────────────────────────────────────────────
 class TA:
+
     @staticmethod
     def ema(arr, period):
         k = 2 / (period + 1)
         v = float(arr[0])
-        for x in arr[1:]:
-            v = float(x) * k + v * (1 - k)
+        for x in arr[1:]: v = float(x) * k + v * (1 - k)
         return v
 
     @staticmethod
     def ema_arr(arr, period):
         k = 2 / (period + 1)
-        result = [float(arr[0])]
-        for x in arr[1:]:
-            result.append(float(x) * k + result[-1] * (1 - k))
-        return np.array(result)
+        r = [float(arr[0])]
+        for x in arr[1:]: r.append(float(x) * k + r[-1] * (1 - k))
+        return np.array(r)
 
     @staticmethod
     def atr(df, period=14):
-        h = df['high'].values
-        l = df['low'].values
-        c = df['close'].values
+        h, l, c = df['high'].values, df['low'].values, df['close'].values
         tr = np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-c[:-1]), abs(l[1:]-c[:-1])))
         return float(np.mean(tr[-period:]))
 
     @staticmethod
-    def adx(df, period=14):
-        h = df['high'].values
-        l = df['low'].values
-        c = df['close'].values
-        plus_dm  = np.where((h[1:]-h[:-1]) > (l[:-1]-l[1:]), np.maximum(h[1:]-h[:-1], 0), 0)
-        minus_dm = np.where((l[:-1]-l[1:]) > (h[1:]-h[:-1]), np.maximum(l[:-1]-l[1:], 0), 0)
-        tr = np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-c[:-1]), abs(l[1:]-c[:-1])))
-        atr_val  = np.mean(tr[-period:]) + 1e-9
-        plus_di  = 100 * np.mean(plus_dm[-period:])  / atr_val
-        minus_di = 100 * np.mean(minus_dm[-period:]) / atr_val
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-        return float(dx), float(plus_di), float(minus_di)
-
-    @staticmethod
-    def supertrend(df, period=10, mult=3.0):
-        h = df['high'].values
-        l = df['low'].values
-        c = df['close'].values
-        atr_vals = []
-        for i in range(1, len(c)):
-            tr = max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
-            atr_vals.append(tr)
-        atr_arr = np.array(atr_vals)
-        upper = (h[1:]+l[1:])/2 + mult * atr_arr
-        lower = (h[1:]+l[1:])/2 - mult * atr_arr
-        trend = np.ones(len(c)-1)
-        for i in range(1, len(trend)):
-            if c[i] > upper[i-1]:
-                trend[i] = 1
-            elif c[i] < lower[i-1]:
-                trend[i] = -1
-            else:
-                trend[i] = trend[i-1]
-        return int(trend[-1])  # 1=UP, -1=DOWN
-
-    @staticmethod
-    def cvd(df):
-        c = df['close'].values
-        v = df['volume'].values
-        o = df['open'].values
-        delta = np.where(c > o, v, np.where(c < o, -v, 0))
-        cvd_arr = np.cumsum(delta)
-        recent  = float(np.mean(cvd_arr[-5:]))
-        prev    = float(np.mean(cvd_arr[-10:-5]))
-        return recent, recent > 0, recent > prev
-
-    @staticmethod
     def rsi(arr, period=14):
-        if len(arr) < period + 1:
-            return 50.0
+        if len(arr) < period + 1: return 50.0
         d = np.diff(arr[-period-1:])
         g = d[d > 0].sum() / period
         l = -d[d < 0].sum() / period
-        return 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+        return 100.0 if l == 0 else 100 - 100 / (1 + g / (l + 1e-9))
 
     @staticmethod
-    def breakout(df, lookback=20):
-        h = df['high'].values
-        c = df['close'].values
-        l = df['low'].values
-        prev_high = np.max(h[-lookback-1:-1])
-        prev_low  = np.min(l[-lookback-1:-1])
-        if c[-1] > prev_high:
-            return 'LONG'
-        elif c[-1] < prev_low:
-            return 'SHORT'
-        return None
+    def adx(df, period=14):
+        h, l, c = df['high'].values, df['low'].values, df['close'].values
+        pdm = np.where((h[1:]-h[:-1]) > (l[:-1]-l[1:]), np.maximum(h[1:]-h[:-1], 0), 0)
+        mdm = np.where((l[:-1]-l[1:]) > (h[1:]-h[:-1]), np.maximum(l[:-1]-l[1:], 0), 0)
+        tr  = np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-c[:-1]), abs(l[1:]-c[:-1])))
+        atr = np.mean(tr[-period:]) + 1e-9
+        pdi = 100 * np.mean(pdm[-period:]) / atr
+        mdi = 100 * np.mean(mdm[-period:]) / atr
+        dx  = 100 * abs(pdi - mdi) / (pdi + mdi + 1e-9)
+        return float(dx), float(pdi), float(mdi)
 
     @staticmethod
-    def volume_spike(df, mult=2.0):
-        v   = df['volume'].values
+    def supertrend(df, period=10, mult=3.0):
+        h, l, c = df['high'].values, df['low'].values, df['close'].values
+        atr_arr = []
+        for i in range(1, len(c)):
+            tr = max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
+            atr_arr.append(tr)
+        atr = np.array(atr_arr)
+        upper = (h[1:]+l[1:])/2 + mult * atr
+        lower = (h[1:]+l[1:])/2 - mult * atr
+        trend = np.ones(len(c)-1)
+        for i in range(1, len(trend)):
+            if c[i] > upper[i-1]:   trend[i] = 1
+            elif c[i] < lower[i-1]: trend[i] = -1
+            else:                    trend[i] = trend[i-1]
+        return int(trend[-1])
+
+    @staticmethod
+    def cvd(df):
+        c, v, o = df['close'].values, df['volume'].values, df['open'].values
+        delta   = np.where(c > o, v, np.where(c < o, -v, 0))
+        arr     = np.cumsum(delta)
+        recent  = float(np.mean(arr[-5:]))
+        prev    = float(np.mean(arr[-10:-5]))
+        return recent, recent > 0, recent > prev
+
+    @staticmethod
+    def obi(ob):
+        try:
+            bids = ob.get('bids', [])
+            asks = ob.get('asks', [])
+            bv = sum(float(b[1]) for b in bids[:10])
+            av = sum(float(a[1]) for a in asks[:10])
+            return bv / (av + 1e-9)
+        except:
+            return 1.0
+
+    @staticmethod
+    def volume_spike(df, mult=1.5):
+        v = df['volume'].values
         avg = np.mean(v[-20:-1])
         return float(v[-1]) > avg * mult, float(v[-1]) / (avg + 1e-9)
 
+    # ── Yapısal Trend: HH/HL veya LH/LL ──────
+    @staticmethod
+    def structural_trend(df, lookback=5):
+        """
+        Gerçek trend tespiti — fiyat yapısına bakır
+        HH+HL → BULL, LH+LL → BEAR
+        """
+        h = df['high'].values
+        l = df['low'].values
+
+        # Son 5 swing high ve low bul
+        swing_highs = []
+        swing_lows  = []
+        for i in range(2, len(h)-2):
+            if h[i] > h[i-1] and h[i] > h[i-2] and h[i] > h[i+1] and h[i] > h[i+2]:
+                swing_highs.append(h[i])
+            if l[i] < l[i-1] and l[i] < l[i-2] and l[i] < l[i+1] and l[i] < l[i+2]:
+                swing_lows.append(l[i])
+
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return 'NEUTRAL'
+
+        sh = swing_highs[-lookback:]
+        sl = swing_lows[-lookback:]
+
+        hh = all(sh[i] > sh[i-1] for i in range(1, len(sh)))  # Higher Highs
+        hl = all(sl[i] > sl[i-1] for i in range(1, len(sl)))  # Higher Lows
+        lh = all(sh[i] < sh[i-1] for i in range(1, len(sh)))  # Lower Highs
+        ll = all(sl[i] < sl[i-1] for i in range(1, len(sl)))  # Lower Lows
+
+        if hh and hl: return 'BULL'
+        if lh and ll: return 'BEAR'
+
+        # Kısmi kontrol (en az 2 nokta)
+        if sh[-1] > sh[-2] and sl[-1] > sl[-2]: return 'BULL'
+        if sh[-1] < sh[-2] and sl[-1] < sl[-2]: return 'BEAR'
+
+        return 'NEUTRAL'
+
+    # ── HTF Trend (EMA + Supertrend + Yapısal) ──
     @staticmethod
     def htf_trend(df_daily, df_4h):
         c_d  = df_daily['close'].values
@@ -310,872 +323,238 @@ class TA:
 
         ema50_d  = TA.ema(c_d, 50)
         ema200_d = TA.ema(c_d, 200)
-        st_d     = TA.supertrend(df_daily)
-        st_4h    = TA.supertrend(df_4h)
-        adx_val, plus_di, minus_di = TA.adx(df_4h)
+        ema20_4h = TA.ema(c_4h, 20)
+        ema50_4h = TA.ema(c_4h, 50)
 
-        daily_bull = ema50_d > ema200_d and c_d[-1] > ema50_d
-        daily_bear = ema50_d < ema200_d and c_d[-1] < ema50_d
+        st_d  = TA.supertrend(df_daily)
+        st_4h = TA.supertrend(df_4h)
+        adx_val, pdi, mdi = TA.adx(df_4h)
 
-        if daily_bull and st_d == 1 and st_4h == 1 and adx_val > CONFIG['adx_threshold']:
+        # Yapısal trend
+        struct_d  = TA.structural_trend(df_daily, 3)
+        struct_4h = TA.structural_trend(df_4h, 4)
+
+        # Son 3 günlük kapanış yönü
+        recent_close_up   = c_d[-1] > c_d[-3]
+        recent_close_down = c_d[-1] < c_d[-3]
+
+        bull_score = 0
+        bear_score = 0
+
+        if ema50_d > ema200_d: bull_score += 1
+        else: bear_score += 1
+
+        if c_d[-1] > ema50_d: bull_score += 1
+        else: bear_score += 1
+
+        if c_4h[-1] > ema20_4h and ema20_4h > ema50_4h: bull_score += 1
+        elif c_4h[-1] < ema20_4h and ema20_4h < ema50_4h: bear_score += 1
+
+        if st_d == 1:  bull_score += 1
+        elif st_d == -1: bear_score += 1
+
+        if st_4h == 1:  bull_score += 1
+        elif st_4h == -1: bear_score += 1
+
+        if struct_d == 'BULL':  bull_score += 2
+        elif struct_d == 'BEAR': bear_score += 2
+
+        if struct_4h == 'BULL':  bull_score += 1
+        elif struct_4h == 'BEAR': bear_score += 1
+
+        if recent_close_up:   bull_score += 1
+        if recent_close_down: bear_score += 1
+
+        if adx_val > CONFIG['adx_threshold']:
+            if pdi > mdi: bull_score += 1
+            else:         bear_score += 1
+
+        log.debug(f"  HTF: bull={bull_score} bear={bear_score} adx={adx_val:.1f} struct_d={struct_d} struct_4h={struct_4h}")
+
+        if bull_score >= 6 and bull_score > bear_score + 2:
             return 'BULL', adx_val
-        elif daily_bear and st_d == -1 and st_4h == -1 and adx_val > CONFIG['adx_threshold']:
+        elif bear_score >= 6 and bear_score > bull_score + 2:
             return 'BEAR', adx_val
         return 'NEUTRAL', adx_val
 
+    # ── Destek/Direnç Bazlı SL ────────────────
     @staticmethod
-    def obi(orderbook):
-        try:
-            bids = orderbook.get('bids', [])
-            asks = orderbook.get('asks', [])
-            bid_vol = sum(float(b[1]) for b in bids[:10])
-            ask_vol = sum(float(a[1]) for a in asks[:10])
-            ratio   = bid_vol / (ask_vol + 1e-9)
-            return float(ratio)
-        except:
-            return 1.0
+    def support_resistance_sl(df_1h, df_4h, df_daily, side, price):
+        """
+        Swing High/Low + Pivot + Order Block kombinasyonu
+        ile dinamik SL hesapla
+        """
+        atr_4h  = TA.atr(df_4h)
+        atr_1h  = TA.atr(df_1h)
+        cfg     = CONFIG
 
-    @staticmethod
-    def liquidation_support(df, side='LONG'):
-        c = df['close'].values
-        l = df['low'].values
-        h = df['high'].values
-        atr_val = TA.atr(df)
-        price   = c[-1]
+        # 1. Swing High/Low
+        h = df_4h['high'].values
+        l = df_4h['low'].values
+        lookback = cfg['swing_lookback']
+        swing_levels = []
+        for i in range(2, min(lookback, len(h))-2):
+            idx = -(i+2)
+            if h[idx] > h[idx-1] and h[idx] > h[idx+1]:
+                swing_levels.append(('high', h[idx]))
+            if l[idx] < l[idx-1] and l[idx] < l[idx+1]:
+                swing_levels.append(('low', l[idx]))
+
+        # 2. Günlük Pivot
+        d_h = df_daily['high'].values[-2]
+        d_l = df_daily['low'].values[-2]
+        d_c = df_daily['close'].values[-2]
+        pivot = (d_h + d_l + d_c) / 3
+        s1 = 2 * pivot - d_h
+        r1 = 2 * pivot - d_l
+
+        # 3. Order Block (son büyük hareketin başlangıcı)
+        c  = df_4h['close'].values
+        v  = df_4h['volume'].values
+        ob_level = None
+        ob_lookback = min(cfg['ob_lookback'], len(c)-1)
+        for i in range(1, ob_lookback):
+            change = abs(c[-i] - c[-i-1]) / (c[-i-1] + 1e-9)
+            if change > 0.01 and v[-i] > np.mean(v[-20:]) * 1.5:
+                ob_level = c[-i-1]  # Hareketin başladığı yer
+                break
+
+        buffer = atr_4h * cfg['pivot_atr_buffer']
+
         if side == 'LONG':
-            support = price - atr_val * 1.5
-            lows    = l[-20:]
-            cluster = np.sum((lows >= support) & (lows <= price)) / 20
-            return cluster > 0.3
+            # En yakın destek seviyeleri
+            candidates = []
+
+            # Swing lows (fiyatın altında)
+            for typ, level in swing_levels:
+                if typ == 'low' and level < price - atr_1h:
+                    candidates.append(level - buffer)
+
+            # S1 pivot
+            if s1 < price - atr_1h:
+                candidates.append(s1 - buffer)
+
+            # Order block
+            if ob_level and ob_level < price - atr_1h:
+                candidates.append(ob_level - buffer)
+
+            if candidates:
+                # Fiyata en yakın ama çok yakın olmayan destek
+                valid = [c for c in candidates if (price - c) / price > cfg['sl_min_pct']]
+                if valid:
+                    sl = max(valid)  # En yakın destek
+                else:
+                    sl = price - atr_4h * 2.0
+            else:
+                sl = price - atr_4h * 2.0
+
+        else:  # SHORT
+            candidates = []
+
+            for typ, level in swing_levels:
+                if typ == 'high' and level > price + atr_1h:
+                    candidates.append(level + buffer)
+
+            if r1 > price + atr_1h:
+                candidates.append(r1 + buffer)
+
+            if ob_level and ob_level > price + atr_1h:
+                candidates.append(ob_level + buffer)
+
+            if candidates:
+                valid = [c for c in candidates if (c - price) / price > cfg['sl_min_pct']]
+                if valid:
+                    sl = min(valid)
+                else:
+                    sl = price + atr_4h * 2.0
+            else:
+                sl = price + atr_4h * 2.0
+
+        # SL sınır kontrolü
+        sl_pct = abs(price - sl) / price
+        if sl_pct < cfg['sl_min_pct']:
+            sl = price * (1 - cfg['sl_min_pct']) if side == 'LONG' else price * (1 + cfg['sl_min_pct'])
+        elif sl_pct > cfg['sl_max_pct']:
+            sl = price * (1 - cfg['sl_max_pct']) if side == 'LONG' else price * (1 + cfg['sl_max_pct'])
+
+        return sl
+
+    # ── Kademeli giriş için trend onayı ──────
+    @staticmethod
+    def trend_confirmed(df_15m, df_1h, side):
+        """
+        2. kademe giriş için güçlü trend onayı
+        15m + 1h Supertrend aynı yönde mi?
+        """
+        st_15m = TA.supertrend(df_15m)
+        st_1h  = TA.supertrend(df_1h)
+        exp    = 1 if side == 'LONG' else -1
+
+        rsi_val = TA.rsi(df_1h['close'].values)
+        rsi_ok  = (side == 'LONG' and 35 < rsi_val < 70) or \
+                  (side == 'SHORT' and 30 < rsi_val < 65)
+
+        return st_15m == exp and st_1h == exp and rsi_ok
+
+    # ── Multi TF Konsensüs ────────────────────
+    @staticmethod
+    def mtf_consensus(df_15m, df_1h, df_4h, side):
+        exp = 1 if side == 'LONG' else -1
+        st_15m = TA.supertrend(df_15m)
+        st_1h  = TA.supertrend(df_1h)
+        st_4h  = TA.supertrend(df_4h)
+        score  = sum([st_15m == exp, st_1h == exp, st_4h == exp])
+        return score, (st_15m, st_1h, st_4h)
+
+    # ── RSI Bölgesi ──────────────────────────
+    @staticmethod
+    def rsi_ok(df, side):
+        val = TA.rsi(df['close'].values)
+        if side == 'LONG':
+            return val < 72, val   # Aşırı alımda değilse
         else:
-            resist  = price + atr_val * 1.5
-            highs   = h[-20:]
-            cluster = np.sum((highs <= resist) & (highs >= price)) / 20
-            return cluster > 0.3
-
-    @staticmethod
-    def big_order_detect(orderbook, threshold_usdt=50000):
-        try:
-            bids = orderbook.get('bids', [])
-            asks = orderbook.get('asks', [])
-            big_bids = sum(1 for b in bids if float(b[0]) * float(b[1]) > threshold_usdt)
-            big_asks = sum(1 for a in asks if float(a[0]) * float(a[1]) > threshold_usdt)
-            return big_bids, big_asks
-        except:
-            return 0, 0
-
-    @staticmethod
-    def candle_direction(df, count=3):
-        """Son N mumun yönü — hepsi aynı mı?"""
-        c = df['close'].values
-        o = df['open'].values
-        directions = [1 if c[i] > o[i] else -1 for i in range(-count, 0)]
-        if all(d == 1 for d in directions):
-            return 1   # Hepsi yeşil
-        elif all(d == -1 for d in directions):
-            return -1  # Hepsi kırmızı
-        return 0       # Karışık
-
-    @staticmethod
-    def rsi_zone(df, period=14):
-        """RSI bölge kontrolü"""
-        val = TA.rsi(df['close'].values, period)
-        if val < 30:   return 'OVERSOLD'    # Aşırı satım
-        elif val > 70: return 'OVERBOUGHT'  # Aşırı alım
-        elif 40 <= val <= 65: return 'NEUTRAL_BULL'  # LONG için ideal
-        elif 35 <= val <= 60: return 'NEUTRAL_BEAR'  # SHORT için ideal
-        return 'NEUTRAL'
-
-    @staticmethod
-    def ema20_filter(df):
-        """Fiyat EMA20 üstünde mi altında mı?"""
-        c   = df['close'].values
-        e20 = TA.ema(c, 20)
-        return 'ABOVE' if c[-1] > e20 else 'BELOW'
-
-    @staticmethod
-    def momentum_check(df, period=10):
-        """Momentum — fiyat ivmesi artıyor mu?"""
-        c = df['close'].values
-        mom = c[-1] - c[-period]
-        mom_prev = c[-2] - c[-period-1]
-        return mom > 0 and mom > mom_prev  # Pozitif ve artıyor
+            return val > 28, val   # Aşırı satımda değilse
 
 
 # ─────────────────────────────────────────────
 #  ÇIKIŞ ANALİZİ
 # ─────────────────────────────────────────────
-class ExitAnalyzer:
+class ExitEngine:
     def __init__(self):
-        self.oi_history = {}  # symbol → [oi değerleri]
+        self.oi_hist = {}
 
-    def update_oi(self, sym, oi_val):
-        if sym not in self.oi_history:
-            self.oi_history[sym] = []
-        self.oi_history[sym].append(oi_val)
-        if len(self.oi_history[sym]) > 10:
-            self.oi_history[sym].pop(0)
+    def update_oi(self, sym, val):
+        if sym not in self.oi_hist: self.oi_hist[sym] = []
+        self.oi_hist[sym].append(val)
+        if len(self.oi_hist[sym]) > 10: self.oi_hist[sym].pop(0)
 
     def oi_dropping(self, sym):
-        hist = self.oi_history.get(sym, [])
-        if len(hist) < 3:
-            return False
-        recent = np.mean(hist[-2:])
-        prev   = np.mean(hist[-4:-2])
-        change = (recent - prev) / (prev + 1e-9) * 100
-        return change < CONFIG['oi_drop_pct']
+        h = self.oi_hist.get(sym, [])
+        if len(h) < 3: return False
+        return np.mean(h[-2:]) < np.mean(h[-4:-2]) * (1 + CONFIG['oi_drop_pct']/100)
 
-    def cvd_divergence(self, df, side):
-        c   = df['close'].values
-        cvd_val, cvd_pos, cvd_rising = TA.cvd(df)
-        if side == 'LONG':
-            price_up = c[-1] > c[-5]
-            return price_up and not cvd_rising
-        else:
-            price_dn = c[-1] < c[-5]
-            return price_dn and cvd_rising
-
-    def obi_reversed(self, orderbook, side):
-        ratio = TA.obi(orderbook)
-        if side == 'LONG':
-            return ratio < 0.8
-        else:
-            return ratio > 1.2
-
-    def htf_weakening(self, df_daily, df_4h):
-        adx_val, _, _ = TA.adx(df_4h)
-        st_4h = TA.supertrend(df_4h)
-        st_d  = TA.supertrend(df_daily)
-        return adx_val < 20 or (st_4h != st_d)
-
-    def volatility_explosion(self, df):
-        atr_now = TA.atr(df, 5)
-        atr_avg = TA.atr(df, 20)
-        return atr_now > atr_avg * CONFIG['atr_explosion_mult']
-
-    def funding_extreme(self, funding):
-        return funding > 0.05 or funding < -0.03
-
-    def btc_crash(self, btc_df):
-        c = btc_df['close'].values
-        change = (c[-1] - c[-4]) / c[-4]
-        return change < -0.02
-
-    def position_too_old(self, opened_at):
-        age = (datetime.now() - opened_at).seconds / 3600
-        return age > CONFIG['max_position_age']
-
-    def score(self, sym, side, df_1h, df_daily, df_4h, orderbook, funding, btc_df, opened_at):
-        signals = 0
+    def score(self, sym, side, df_1h, df_daily, df_4h, ob, funding, btc_1h, opened_at):
+        pts = 0
         reasons = []
 
+        # 1. OI düşüyor
         if self.oi_dropping(sym):
-            signals += 1; reasons.append('OI↓')
-        if self.cvd_divergence(df_1h, side):
-            signals += 2; reasons.append('CVD_DIV')
-        if self.obi_reversed(orderbook, side):
-            signals += 1; reasons.append('OBI_REV')
-        if self.htf_weakening(df_daily, df_4h):
-            signals += 1; reasons.append('HTF_WEAK')
-        if self.funding_extreme(funding):
-            signals += 2; reasons.append('FUND_EXT')
-        if self.btc_crash(btc_df):
-            signals += 3; reasons.append('BTC_CRASH')
-        if self.volatility_explosion(df_1h):
-            signals += 1; reasons.append('VOL_EXP')
-        if self.position_too_old(opened_at):
-            signals += 1; reasons.append('TOO_OLD')
+            pts += 1; reasons.append('OI↓')
 
-        if signals >= 4:
-            return 'FULL_EXIT', reasons
-        elif signals >= 2:
-            return 'PARTIAL_EXIT', reasons
-        elif signals >= 1:
-            return 'TIGHTEN_SL', reasons
-        return 'HOLD', reasons
-
-
-# ─────────────────────────────────────────────
-#  PAPER TRADING TRACKER
-# ─────────────────────────────────────────────
-class PaperTracker:
-    def __init__(self, balance):
-        self.balance   = balance
-        self.start_bal = balance
-        self.positions = {}
-        self.trades    = []
-
-    def open(self, sym, side, qty, entry, sl, tp1, tp2):
-        if self.balance < qty:
-            log.warning(f"Yetersiz bakiye: {self.balance:.2f}")
-            return False
-        self.positions[sym] = {
-            'side': side, 'entry': entry, 'qty': qty,
-            'sl': sl, 'tp1': tp1, 'tp2': tp2,
-            'tp1_hit': False, 'opened': datetime.now(),
-            'partial': False
-        }
-        self.balance -= qty
-        log.info(f"[PAPER] OPEN {side} {sym} @{entry:.4f} │ {qty} USDT")
-        return True
-
-    def partial_close(self, sym, price, reason):
-        if sym not in self.positions:
-            return 0
-        pos  = self.positions[sym]
-        half = pos['qty'] / 2
-        pnl  = half * (price - pos['entry']) / pos['entry'] * (1 if pos['side'] == 'LONG' else -1)
-        self.balance    += half + pnl
-        pos['qty']      -= half
-        pos['partial']   = True
-        pos['sl']        = pos['entry']
-        self.trades.append({'sym': sym, 'pnl': pnl, 'reason': f'PARTIAL_{reason}'})
-        log.info(f"[PAPER] PARTIAL {sym} @{price:.4f} │ PNL:{pnl:+.2f}")
-        return pnl
-
-    def close(self, sym, price, reason):
-        if sym not in self.positions:
-            return 0, 0, 0
-        pos   = self.positions.pop(sym)
-        pnl   = pos['qty'] * (price - pos['entry']) / pos['entry'] * (1 if pos['side'] == 'LONG' else -1)
-        self.balance += pos['qty'] + pnl
-        self.trades.append({'sym': sym, 'pnl': pnl, 'reason': reason})
-        em = '✅' if pnl > 0 else '❌'
-        log.info(f"[PAPER] CLOSE {em} {sym} @{price:.4f} │ {reason} │ PNL:{pnl:+.2f}")
-        return pnl, pos['entry'], price
-
-    def check_tp_sl(self, sym, price):
-        if sym not in self.positions:
-            return None, 0, 0, 0
-        pos  = self.positions[sym]
-        side = pos['side']
-        hit_sl  = (side == 'LONG'  and price <= pos['sl']) or \
-                  (side == 'SHORT' and price >= pos['sl'])
-        hit_tp2 = (side == 'LONG'  and price >= pos['tp2']) or \
-                  (side == 'SHORT' and price <= pos['tp2'])
-        hit_tp1 = not pos['tp1_hit'] and (
-            (side == 'LONG'  and price >= pos['tp1']) or
-            (side == 'SHORT' and price <= pos['tp1'])
-        )
-        if hit_sl:
-            pnl, ep, cp = self.close(sym, price, 'SL')
-            return 'SL', pnl, ep, cp
-        if hit_tp2:
-            pnl, ep, cp = self.close(sym, price, 'TP2')
-            return 'TP2', pnl, ep, cp
-        if hit_tp1:
-            pos['tp1_hit'] = True
-            pos['sl'] = pos['entry']
-            log.info(f"[PAPER] TP1 {sym} → SL başa çekildi")
-            return 'TP1', 0, 0, 0
-        return None, 0, 0, 0
-
-    def stats(self):
-        pnls    = [t['pnl'] for t in self.trades]
-        winning = [p for p in pnls if p > 0]
-        losing  = [p for p in pnls if p <= 0]
-        return {
-            'count'    : len(pnls),
-            'winning'  : len(winning),
-            'losing'   : len(losing),
-            'total_pnl': sum(pnls),
-            'win_rate' : len(winning) / len(pnls) * 100 if pnls else 0,
-            'balance'  : self.balance,
-            'trades'   : self.trades
-        }
-
-
-# ─────────────────────────────────────────────
-#  BİLDİRİM
-# ─────────────────────────────────────────────
-class Notifier:
-    def __init__(self, channel):
-        self.ch = channel
-        self.ok = bool(channel)
-
-    def _coin_to_cmc(self, sym):
-        """BTC-USDT → CoinMarketCap linki"""
-        name = sym.replace('-USDT','').replace('-','').lower()
-        names = {
-            'btc': 'bitcoin', 'eth': 'ethereum', 'sol': 'solana',
-            'bnb': 'bnb', 'avax': 'avalanche-2', 'link': 'chainlink',
-            'doge': 'dogecoin', 'arb': 'arbitrum', 'op': 'optimism',
-            'pol': 'polygon', 'apt': 'aptos', 'sui': 'sui'
-        }
-        slug = names.get(name, name)
-        return f"https://coinmarketcap.com/currencies/{slug}/"
-
-    def _coin_to_bingx(self, sym):
-        """BTC-USDT → BingX futures linki"""
-        pair = sym.replace('-', '_')
-        return f"https://bingx.com/en/futures/{pair}/"
-
-    def send(self, msg, link=None, title=None, priority='default'):
-        if not self.ok:
-            log.info(f"[NOTIF] {msg[:100]}")
-            return
-        try:
-            clean = msg.replace('<b>','').replace('</b>','').replace('<code>','').replace('</code>','')
-            headers = {'Priority': priority}
-            if title:
-                headers['Title'] = title
-            if link:
-                headers['Click'] = link          # Bildirime tıklayınca açılır
-                headers['Actions'] = (
-                    f"view, 📊 CoinMarketCap, {self._coin_to_cmc(link) if 'BTC' in link or 'ETH' in link or 'SOL' in link or 'BNB' in link else link}; "
-                    f"view, 🔄 BingX, {self._coin_to_bingx(link) if '-USDT' in link else link}"
-                )
-            requests.post(
-                f'https://ntfy.sh/{self.ch}',
-                data=clean.encode('utf-8'),
-                headers=headers,
-                timeout=5
-            )
-        except:
-            pass
-
-    def _ntfy_send(self, title, msg, sym, priority='default'):
-        if not self.ok:
-            log.info(f"[NOTIF] {title} | {msg[:80]}")
-            return
-        try:
-            cmc   = self._coin_to_cmc(sym)
-            bingx = self._coin_to_bingx(sym)
-            headers = {
-                'Title'   : title,
-                'Priority': priority,
-                'Click'   : cmc,
-                'Actions' : f"view, CoinMarketCap, {cmc}; view, BingX Futures, {bingx}",
-                'Tags'    : 'chart_with_upwards_trend'
-            }
-            requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), headers=headers, timeout=5)
-        except Exception as e:
-            log.warning(f"Bildirim hatasi: {e}")
-            try:
-                requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), timeout=5)
-            except:
-                pass
-
-    def entry(self, sym, side, price, qty, sl, tp1, tp2, reasons, paper):
-        mode  = 'PAPER' if paper else 'CANLI'
-        em    = '🟢 LONG' if side == 'LONG' else '🔴 SHORT'
-        title = f"{em} — {sym} [{mode}]"
-        msg   = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 {sym}  |  {em}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 Giriş  : {price:.4f}\n"
-            f"🎯 TP1    : {tp1:.4f}\n"
-            f"🎯 TP2    : {tp2:.4f}\n"
-            f"🛑 SL     : {sl:.4f}\n"
-            f"💰 Miktar : {qty} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        self._ntfy_send(title, msg, sym, priority='high')
-
-    def exit_msg(self, sym, reason, pnl, balance, entry_price, close_price, paper):
-        mode  = 'PAPER' if paper else 'CANLI'
-        em    = '✅ KAZANC' if pnl > 0 else '❌ KAYIP'
-        title = f"{em} — {sym}  {pnl:+.2f} USDT [{mode}]"
-        msg   = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 {sym}  |  {em}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔓 Giris  : {entry_price:.4f}\n"
-            f"🔒 Cikis  : {close_price:.4f}\n"
-            f"📊 Sebep  : {reason}\n"
-            f"💰 PNL    : {pnl:+.2f} USDT\n"
-            f"🏦 Bakiye : {balance:.2f} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        priority = 'high' if pnl > 0 else 'default'
-        self._ntfy_send(title, msg, sym, priority=priority)
-
-    def daily_report(self, stats, paper):
-        mode = 'PAPER' if paper else 'CANLI'
-        pnl  = stats['total_pnl']
-        em   = '📈' if pnl >= 0 else '📉'
-        title = f"{em} GUNLUK RAPOR [{mode}]"
-        msg  = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{em} GUNLUK RAPOR [{mode}]\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Islem  : {stats['count']}\n"
-            f"✅ Kazanc : {stats['winning']}\n"
-            f"❌ Kayip  : {stats['losing']}\n"
-            f"🎯 Win    : %{stats['win_rate']:.1f}\n"
-            f"💰 PNL    : {pnl:+.2f} USDT\n"
-            f"🏦 Bakiye : {stats['balance']:.2f} USDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        if self.ok:
-            try:
-                headers = {'Title': title, 'Priority': 'default', 'Tags': 'bar_chart'}
-                requests.post(f'https://ntfy.sh/{self.ch}', data=msg.encode('utf-8'), headers=headers, timeout=5)
-            except:
-                pass
-        else:
-            log.info(f"[NOTIF] {title}")
-
-    def blocked(self, sym, missing):
-        self.send(f"⚠️ {sym} — Koşullar sağlanmadı\n❌ {' │ '.join(missing)}")
-
-
-# ─────────────────────────────────────────────
-#  ANA BOT
-# ─────────────────────────────────────────────
-class CipherV2:
-    def __init__(self):
-        self.cfg    = CONFIG
-        self.cli    = BingXClient(self.cfg['api_key'], self.cfg['api_secret'], self.cfg['paper_trading'])
-        self.ta      = TA()
-        self.exit_a  = ExitAnalyzer()
-        self.sent    = SentimentAnalyzer()
-        self.paper  = PaperTracker(self.cfg['initial_balance'])
-        self.notif  = Notifier(self.cfg['ntfy_channel'])
-        self.running = True
-
-        # Risk takip
-        self.daily_losses    = 0
-        self.daily_pnl       = 0.0
-        self.last_reset_date = date.today()
-        self.sl_times        = {}  # symbol → son SL zamanı
-
-        # Cache
-        self.btc_cache = {}
-        self.oi_prev   = {}
-
-        log.info("═" * 50)
-        log.info("  CIPHER V2 BAŞLADI")
-        log.info(f"  Mod    : {'📝 PAPER' if self.cfg['paper_trading'] else '💰 GERÇEK'}")
-        log.info(f"  Coinler: {', '.join(self.cfg['symbols'])}")
-        log.info(f"  Kaldıraç: {self.cfg['leverage']}x")
-        log.info("═" * 50)
-
-        self.notif.send(
-            f"🚀 CIPHER V2 BAŞLADI\n"
-            f"{'📝 Paper' if self.cfg['paper_trading'] else '💰 GERÇEK'}\n"
-            f"Coinler: {', '.join(self.cfg['symbols'])}\n"
-            f"Kaldıraç: {self.cfg['leverage']}x\n"
-            f"Bakiye: {self.cfg['initial_balance']} USDT"
-        )
-
-    # ── Günlük reset ──────────────────────────
-    def _daily_reset(self):
-        today = date.today()
-        if today > self.last_reset_date:
-            stats = self.paper.stats()
-            self.notif.daily_report(stats, self.cfg['paper_trading'])
-            self.daily_losses    = 0
-            self.daily_pnl       = 0.0
-            self.last_reset_date = today
-            log.info("🔄 Günlük sayaçlar sıfırlandı")
-
-    # ── BTC verisi cache ───────────────────────
-    def _btc_data(self):
-        now = time.time()
-        if 'ts' in self.btc_cache and now - self.btc_cache['ts'] < 300:
-            return self.btc_cache['d']
-        d = {
-            '1h'   : self.cli.klines('BTC-USDT', '1h',  200),
-            '4h'   : self.cli.klines('BTC-USDT', '4h',  200),
-            'daily': self.cli.klines('BTC-USDT', '1d',  200)
-        }
-        self.btc_cache = {'ts': now, 'd': d}
-        return d
-
-    # ── Dinamik pozisyon büyüklüğü ─────────────
-    def _qty(self, score):
-        if score >= 8:   return self.cfg['usdt_per_trade'] * 1.5
-        elif score >= 6: return self.cfg['usdt_per_trade']
-        else:            return self.cfg['usdt_per_trade'] * 0.7
-
-    # ── Giriş analizi ──────────────────────────
-    def _entry_check(self, sym, btc):
-        passed  = []
-        failed  = []
-        score   = 0
-
-        try:
-            df_1h    = self.cli.klines(sym, '1h',  200)
-            df_4h    = self.cli.klines(sym, '4h',  200)
-            df_daily = self.cli.klines(sym, '1d',  200)
-            df_15m   = self.cli.klines(sym, '15m', 100)
-            ob       = self.cli.orderbook(sym, 20)
-            oi       = self.cli.open_interest(sym)
-            funding  = self.cli.funding_rate(sym)
-        except Exception as e:
-            log.warning(f"Veri hatası {sym}: {e}")
-            return None
-
+        # 2. CVD Divergence — en güçlü sinyal
         c = df_1h['close'].values
+        _, cvd_pos, cvd_rising = TA.cvd(df_1h)
+        if side == 'LONG' and c[-1] > c[-5] and not cvd_rising:
+            pts += 2; reasons.append('CVD_DIV')
+        elif side == 'SHORT' and c[-1] < c[-5] and cvd_rising:
+            pts += 2; reasons.append('CVD_DIV')
 
-        # ── 1. HTF Trend ──
-        trend, adx_val = TA.htf_trend(df_daily, df_4h)
-        if trend == 'BULL':
-            passed.append(f'HTF_BULL(ADX:{adx_val:.0f})')
-            score += 2
-            side = 'LONG'
-        elif trend == 'BEAR':
-            passed.append(f'HTF_BEAR(ADX:{adx_val:.0f})')
-            score += 2
-            side = 'SHORT'
-        else:
-            failed.append('HTF_NEUTRAL')
-            return None  # Trend belirsizse hiç işlem açma
+        # 3. OBI tersine döndü
+        obi = TA.obi(ob)
+        if side == 'LONG' and obi < 0.8:
+            pts += 1; reasons.append('OBI_REV')
+        elif side == 'SHORT' and obi > 1.25:
+            pts += 1; reasons.append('OBI_REV')
 
-        # ── 2. Multi TF Konsensüs ──
-        st_15m = TA.supertrend(df_15m)
-        st_1h  = TA.supertrend(df_1h)
-        st_4h  = TA.supertrend(df_4h)
-        exp    = 1 if side == 'LONG' else -1
-        if st_15m == exp and st_1h == exp and st_4h == exp:
-            passed.append('MTF_OK')
-            score += 2
-        else:
-            failed.append(f'MTF_FAIL({st_15m}/{st_1h}/{st_4h})')
-            return None
-
-        # ── 3. Breakout ──
-        bo = TA.breakout(df_1h)
-        if bo == side:
-            passed.append(f'BREAKOUT_{bo}')
-            score += 1
-        else:
-            failed.append('NO_BREAKOUT')
-
-        # ── 4. Volume Spike ──
-        vol_spike, vol_ratio = TA.volume_spike(df_1h, self.cfg['volume_spike_mult'])
-        if vol_spike:
-            passed.append(f'VOL_SPIKE({vol_ratio:.1f}x)')
-            score += 1
-        else:
-            failed.append(f'VOL_LOW({vol_ratio:.1f}x)')
-
-        # ── 5. OI Artışı ──
-        prev_oi = self.oi_prev.get(sym, oi)
-        oi_chg  = (oi - prev_oi) / (prev_oi + 1e-9) * 100
-        self.oi_prev[sym] = oi
-        self.exit_a.update_oi(sym, oi)
-        if oi_chg >= self.cfg['oi_change_pct']:
-            passed.append(f'OI_UP({oi_chg:+.1f}%)')
-            score += 1
-        else:
-            failed.append(f'OI_FLAT({oi_chg:+.1f}%)')
-
-        # ── 6. Funding Rate ──
-        f_ok = self.cfg['funding_min'] <= funding <= self.cfg['funding_max']
-        if f_ok:
-            passed.append(f'FUND_OK({funding:.4f})')
-            score += 1
-        else:
-            failed.append(f'FUND_BAD({funding:.4f})')
-            return None
-
-        # ── 7. OBI ──
-        obi_val = TA.obi(ob)
-        if side == 'LONG' and obi_val >= self.cfg['obi_threshold']:
-            passed.append(f'OBI_BULL({obi_val:.2f})')
-            score += 1
-        elif side == 'SHORT' and obi_val <= (1 / self.cfg['obi_threshold']):
-            passed.append(f'OBI_BEAR({obi_val:.2f})')
-            score += 1
-        else:
-            failed.append(f'OBI_NEUTRAL({obi_val:.2f})')
-
-        # ── 8. CVD ──
-        cvd_val, cvd_pos, cvd_rising = TA.cvd(df_1h)
-        cvd_ok = (side == 'LONG' and cvd_pos and cvd_rising) or \
-                 (side == 'SHORT' and not cvd_pos and not cvd_rising)
-        if cvd_ok:
-            passed.append(f'CVD_OK({cvd_val:.0f})')
-            score += 1
-        else:
-            failed.append(f'CVD_FAIL({cvd_val:.0f})')
-
-        # ── 9. Liquidation Desteği ──
-        liq_ok = TA.liquidation_support(df_1h, side)
-        if liq_ok:
-            passed.append('LIQ_SUPPORT')
-            score += 1
-        else:
-            failed.append('NO_LIQ_SUPPORT')
-
-        # ── 10. Büyük Emir ──
-        big_bids, big_asks = TA.big_order_detect(ob)
-        if side == 'LONG' and big_bids > 0:
-            passed.append(f'BIG_BID({big_bids})')
-            score += 1
-        elif side == 'SHORT' and big_asks > 0:
-            passed.append(f'BIG_ASK({big_asks})')
-            score += 1
-        else:
-            failed.append('NO_BIG_ORDER')
-
-        # ── 11. BTC Korelasyon ──
-        btc_c  = btc['1h']['close'].values
-        btc_chg = (btc_c[-1] - btc_c[-4]) / btc_c[-4]
-        if side == 'LONG' and btc_chg > self.cfg['btc_drop_limit']:
-            passed.append(f'BTC_OK({btc_chg:+.2%})')
-            score += 1
-        elif side == 'SHORT':
-            passed.append(f'BTC_SHORT_OK')
-            score += 1
-        else:
-            failed.append(f'BTC_DROP({btc_chg:+.2%})')
-            return None
-
-        # ── Minimum skor kontrolü ──
-        if score < 6:
-            log.debug(f"  {sym} skor düşük: {score}/13 │ ❌ {', '.join(failed[:3])}")
-            return None
-
-        # ── Yeni Trend Filtreleri ──
-
-        # 12. Mum yönü kontrolü (son 3 mum)
-        candle_dir = TA.candle_direction(df_1h, 3)
-        exp_dir = 1 if side == 'LONG' else -1
-        if candle_dir == exp_dir:
-            passed.append(f'CANDLE_OK')
-            score += 1
-        elif candle_dir == 0:
-            passed.append('CANDLE_MIX')  # Karışık ama engel değil
-        else:
-            failed.append('CANDLE_AGAINST')
-            return None  # Mumlar ters yönde — girme
-
-        # 13. RSI bölge kontrolü
-        rsi_zone = TA.rsi_zone(df_1h)
-        rsi_ok = (side == 'LONG' and rsi_zone in ['OVERSOLD','NEUTRAL_BULL']) or                  (side == 'SHORT' and rsi_zone in ['OVERBOUGHT','NEUTRAL_BEAR'])
-        if rsi_ok:
-            passed.append(f'RSI_OK({rsi_zone})')
-            score += 1
-        else:
-            failed.append(f'RSI_BAD({rsi_zone})')
-            return None  # RSI aşırı bölgede — girme
-
-        # 14. EMA20 filtresi
-        ema20 = TA.ema20_filter(df_1h)
-        ema20_ok = (side == 'LONG' and ema20 == 'ABOVE') or                    (side == 'SHORT' and ema20 == 'BELOW')
-        if ema20_ok:
-            passed.append(f'EMA20_OK')
-            score += 1
-        else:
-            failed.append(f'EMA20_FAIL')
-
-        # 15. Momentum kontrolü
-        mom_ok = TA.momentum_check(df_1h)
-        if mom_ok:
-            passed.append('MOM_OK')
-            score += 1
-        else:
-            failed.append('MOM_WEAK')
-
-        # 16. Fear & Greed + CryptoPanic (Sentiment)
-        try:
-            coin = side.split('-')[0] if '-' in sym else sym.split('-')[0]
-            fg   = self.sent.fear_greed()
-            cp   = self.sent.cryptopanic(coin)
-            sent_ok = self.sent.sentiment_ok(side, fg['score'], cp['score'])
-            if sent_ok:
-                passed.append(f"SENT_OK(FG:{fg['score']}/CP:{cp['score']:.2f})")
-                score += 2
-            else:
-                failed.append(f"SENT_FAIL(FG:{fg['score']}/CP:{cp['score']:.2f})")
-                return None  # Sentiment ters — girme
-        except Exception as e:
-            log.warning(f"Sentiment hatası: {e}")
-            passed.append('SENT_SKIP')  # Hata varsa atla
-
-        # ── TP / SL hesapla — 4h ATR ile daha geniş ──
-        price   = float(c[-1])
-        atr_1h  = TA.atr(df_1h)
-        atr_4h  = TA.atr(df_4h)
-        atr_val = atr_4h  # 4h ATR kullan — daha geniş SL
-        if side == 'LONG':
-            sl  = price - atr_val * 2.0   # Daha geniş SL
-            tp1 = price + atr_val * 1.5
-            tp2 = price + atr_val * 3.5   # Daha büyük TP hedefi
-        else:
-            sl  = price + atr_val * 2.0
-            tp1 = price - atr_val * 1.5
-            tp2 = price - atr_val * 3.5
-
-        return {
-            'sym': sym, 'side': side, 'price': price,
-            'sl': sl, 'tp1': tp1, 'tp2': tp2,
-            'score': score, 'passed': passed, 'failed': failed,
-            'funding': funding, 'df_1h': df_1h, 'df_4h': df_4h,
-            'df_daily': df_daily, 'ob': ob
-        }
-
-    # ── Açık pozisyon izleme ───────────────────
-    def _monitor_positions(self, btc):
-        for sym in list(self.paper.positions.keys()):
-            try:
-                tk    = self.cli.ticker(sym)
-                price = float(tk.get('lastPrice', 0))
-                pos   = self.paper.positions.get(sym)
-                if not pos:
-                    continue
-
-                # TP/SL kontrolü
-                reason, pnl, entry_p, close_p = self.paper.check_tp_sl(sym, price)
-                if reason and reason != 'TP1':
-                    if pnl < 0:
-                        self.daily_losses += 1
-                    self.daily_pnl += pnl
-                    self.notif.exit_msg(sym, reason, pnl, self.paper.balance, entry_p, close_p, self.cfg['paper_trading'])
-                    if reason == 'SL':
-                        self.sl_times[sym] = time.time()
-                    continue
-
-                # Kademeli çıkış analizi
-                try:
-                    df_1h    = self.cli.klines(sym, '1h',  100)
-                    df_4h    = self.cli.klines(sym, '4h',  100)
-                    df_daily = self.cli.klines(sym, '1d',  100)
-                    ob       = self.cli.orderbook(sym, 20)
-                    funding  = self.cli.funding_rate(sym)
-
-                    exit_sig, reasons = self.exit_a.score(
-                        sym, pos['side'], df_1h, df_daily, df_4h,
-                        ob, funding, btc['1h'], pos['opened']
-                    )
-
-                    if exit_sig == 'FULL_EXIT':
-                        pnl = self.paper.close(sym, price, f"EXIT:{','.join(reasons)}")
-                        self.daily_pnl += pnl
-                        self.notif.exit_msg(sym, f"ÇIKIŞ: {', '.join(reasons)}", pnl, self.paper.balance, self.cfg['paper_trading'])
-                        log.info(f"  🚪 FULL EXIT {sym} │ {', '.join(reasons)}")
-
-                    elif exit_sig == 'PARTIAL_EXIT' and not pos.get('partial'):
-                        pnl = self.paper.partial_close(sym, price, ','.join(reasons))
-                        self.daily_pnl += pnl
-                        self.notif.send(f"⚠️ {sym} KISMİ ÇIKIŞ\n{', '.join(reasons)}\nPNL: {pnl:+.2f}")
-                        log.info(f"  ⚠️  PARTIAL EXIT {sym} │ {', '.join(reasons)}")
-
-                    elif exit_sig == 'TIGHTEN_SL':
-                        log.info(f"  🔒 SL SIKIŞTIRILDI {sym} │ {', '.join(reasons)}")
-
-                except Exception as e:
-                    log.warning(f"Çıkış analizi {sym}: {e}")
-
-            except Exception as e:
-                log.warning(f"İzleme {sym}: {e}")
-
-    # ── Ana tarama ─────────────────────────────
-    def scan(self):
-        self._daily_reset()
-
-        log.info(f"\n{'─'*50}")
-        log.info(f"🔍 TARAMA │ {datetime.now().strftime('%H:%M:%S')} │ Açık: {len(self.paper.positions)}")
-
-        # Günlük limit kapalı
-
-        # BTC verisi
-        try:
-            btc = self._btc_data()
-        except Exception as e:
-            log.error(f"BTC verisi: {e}")
-            return
-
-        # Açık pozisyonları izle
-        self._monitor_positions(btc)
-
-        # Max pozisyon kontrolü
-        if len(self.paper.positions) >= self.cfg['max_positions']:
-            log.info(f"Max pozisyon dolu ({self.cfg['max_positions']})")
-            return
-
-        # Her coin için analiz
-        for sym in self.cfg['symbols']:
-            if not self.running:
-                break
-            if sym in self.paper.positions:
-                continue
-            if len(self.paper.positions) >= self.cfg['max_positions']:
-                break
-
-            # Tekrar giriş engeli
-            last_sl = self.sl_times.get(sym, 0)
-            if time.time() - last_sl < self.cfg['reentry_wait_secs']:
-                wait = int((self.cfg['reentry_wait_secs'] - (time.time() - last_sl)) / 60)
-                log.info(f"  ⏳ {sym} → {wait}dk bekleniyor (SL sonrası)")
-                continue
-
-            log.info(f"  ▷ {sym} analiz ediliyor...")
-
-            result = self._entry_check(sym, btc)
-
-            if result:
-                qty = self._qty(result['score'])
-                log.info(
-                    f"  ✅ {sym} {result['side']} │ "
-                    f"Skor:{result['score']} │ "
-                    f"Miktar:{qty} USDT\n"
-                    f"     Geçen: {', '.join(result['passed'])}"
-                )
-
-                if self.cfg['paper_trading']:
-                    ok = self.paper.open(
-                        sym, result['side'], qty,
-                        result['price'], result['sl'],
-                        result['tp1'], result['tp2']
-                    )
-                    if ok:
-                        self.notif.entry(
-                            sym, result['side'], result['price'],
-                            qty, result['sl'], result['tp1'], result['tp2'],
-                            result['passed'], True
-                        )
-                else:
-                    self.cli.set_leverage(sym, self.cfg['leverage'])
-                    self.cli.place_order(
-                        sym,
-                        'BUY' if result['side'] == 'LONG' else 'SELL',
-                        qty, sl=result['sl'], tp=result['tp1']
-                    )
-                    self.notif.entry(
-                        sym, result['side'], result['price'],
-                        qty, result['sl'], result['tp1'], result['tp2'],
-                        result['passed'], False
-                    )
-            else:
-                log.info(f"  ✕ {sym} → Koşullar sağlanmadı")
-
-            time.sleep(1)
-
-        # Özet
-        s = self.paper.stats()
-        log.info(
-            f"📊 Açık:{len(self.paper.positions)} │ "
-            f"Bakiye:{self.paper.balance:.2f} │ "
-            f"PNL:{s['total_pnl']:+.2f} │ "
-            f"WR:%{s['win_rate']:.0f}"
-        )
-
-    # ── Bot döngüsü ────────────────────────────
-    def run(self):
-        interval = self.cfg['scan_interval_minutes'] * 60
-        while self.running:
-            try:
-                self.scan()
-            except Exception as e:
-                log.error(f"Tarama hatası: {e}")
-                self.notif.send(f"⚠️ Hata: {e}")
-            log.info(f"💤 {self.cfg['scan_interval_minutes']}dk bekleniyor...\n")
-            time.sleep(interval)
-
-
-# ─────────────────────────────────────────────
-#  ENTRY
-# ─────────────────────────────────────────────
-if __name__ == '__main__':
-    bot = CipherV2()
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        s = bot.paper.stats()
-        bot.notif.send(f"⏹ Durduruldu │ PNL:{s['total_pnl']:+.2f} USDT")
-        log.info("Bot durduruldu")
+        # 4. HTF zayıflama
+        adx_
