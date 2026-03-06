@@ -25,7 +25,7 @@ CONFIG = {
         'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT',
         'AVAX-USDT', 'LINK-USDT', 'ARB-USDT', 'OP-USDT',
         'DOGE-USDT', 'APT-USDT', 'SUI-USDT', 'DOT-USDT',
-        'MATIC-USDT', 'ATOM-USDT', 'INJ-USDT',
+        'POL-USDT', 'ATOM-USDT', 'INJ-USDT',
     ],
 
     # ═══════════════════════════════════════
